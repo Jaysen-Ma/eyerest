@@ -43,12 +43,18 @@ CAT_FRAMES = {
     "lie": ["cat_lie_sprite.png"],
 }
 
+SESSION_BLINK = "blink"
+SESSION_LONG = "long"
+
 # Win32 virtual-screen metrics (all monitors)
 SM_XVIRTUALSCREEN = 76
 SM_YVIRTUALSCREEN = 77
 SM_CXVIRTUALSCREEN = 78
 SM_CYVIRTUALSCREEN = 79
 MONITOR_DEFAULTTOPRIMARY = 1
+SPI_SETDESKWALLPAPER = 0x0014
+SPI_GETDESKWALLPAPER = 0x0073
+MAX_PATH = 260
 
 
 class _RECT(ctypes.Structure):
@@ -95,58 +101,121 @@ def ease_in_out(t: float) -> float:
     return t * t * (3.0 - 2.0 * t)
 
 
-def blink(fade_seconds: float = FADE_SECONDS) -> None:
-    """Fullscreen black overlay: fade to black, then back to normal."""
+def refresh_desktop() -> None:
+    """Ask Windows to redraw the desktop after a translucent overlay closes."""
+    user32 = ctypes.windll.user32
+    # Do NOT call SPI_SETDESKWALLPAPER with NULL — that clears the wallpaper.
+    buffer = ctypes.create_unicode_buffer(MAX_PATH)
+    if user32.SystemParametersInfoW(SPI_GETDESKWALLPAPER, MAX_PATH, buffer, 0):
+        path = buffer.value
+        if path:
+            user32.SystemParametersInfoW(SPI_SETDESKWALLPAPER, 0, path, 0)
+    for class_name in ("Progman", "WorkerW", "Shell_TrayWnd"):
+        hwnd = user32.FindWindowW(class_name, None)
+        if hwnd:
+            user32.InvalidateRect(hwnd, None, True)
+            user32.UpdateWindow(hwnd)
+
+
+def close_overlay(win: tk.Misc, done: threading.Event | None = None) -> None:
+    """Safely tear down an overlay without leaving compositor artifacts."""
+    try:
+        win.attributes("-alpha", 0.0)
+    except tk.TclError:
+        pass
+    try:
+        win.withdraw()
+        win.update_idletasks()
+        win.destroy()
+    except tk.TclError:
+        pass
+    refresh_desktop()
+    if done is not None:
+        done.set()
+
+
+def _make_overlay(
+    master: tk.Misc | None,
+    title: str,
+    bg: str,
+) -> tuple[tk.Misc, bool]:
+    """Create either a standalone Tk root or a Toplevel under an existing app."""
     x, y, width, height = virtual_screen_bounds()
+    if master is None:
+        win: tk.Misc = tk.Tk()
+        owns_loop = True
+    else:
+        win = tk.Toplevel(master)
+        owns_loop = False
+    win.title(title)
+    win.overrideredirect(True)
+    win.attributes("-topmost", True)
+    win.configure(bg=bg)
+    win.geometry(f"{width}x{height}+{x}+{y}")
+    win.focus_force()
+    return win, owns_loop
 
-    root = tk.Tk()
-    root.title("EyeRest")
-    root.overrideredirect(True)
-    root.attributes("-topmost", True)
-    root.configure(bg="black")
-    root.geometry(f"{width}x{height}+{x}+{y}")
-    root.attributes("-alpha", 0.0)
-    root.focus_force()
 
-    dismissed = {"value": False}
+def blink(
+    fade_seconds: float = FADE_SECONDS,
+    master: tk.Misc | None = None,
+    done: threading.Event | None = None,
+) -> None:
+    """Fullscreen black overlay: fade to black, then back to normal."""
+    win, owns_loop = _make_overlay(master, "EyeRest", "black")
+    win.attributes("-alpha", 0.0)
 
-    def dismiss(_event: object | None = None) -> None:
-        dismissed["value"] = True
-        root.destroy()
+    finished = {"value": False}
 
-    root.bind("<Escape>", dismiss)
-    root.bind("<Button-1>", dismiss)
+    def finish(_event: object | None = None) -> None:
+        if finished["value"]:
+            return
+        finished["value"] = True
+        close_overlay(win, done)
+
+    win.bind("<Escape>", finish)
+    win.bind("<Button-1>", finish)
 
     total_steps = max(1, int(fade_seconds * FPS))
     frame_ms = max(1, int(1000 / FPS))
     step = {"i": 0}
 
     def tick() -> None:
-        if dismissed["value"]:
+        if finished["value"]:
             return
         i = step["i"]
         if i >= total_steps:
-            root.destroy()
+            finish()
             return
 
         progress = i / (total_steps - 1) if total_steps > 1 else 1.0
         alpha = progress * 2 if progress <= 0.5 else 2 * (1.0 - progress)
-        root.attributes("-alpha", max(0.0, min(1.0, alpha)))
+        try:
+            win.attributes("-alpha", max(0.0, min(1.0, alpha)))
+        except tk.TclError:
+            finish()
+            return
 
         step["i"] = i + 1
-        root.after(frame_ms, tick)
+        win.after(frame_ms, tick)
 
-    root.after(0, tick)
-    root.mainloop()
+    win.after(0, tick)
+    if owns_loop:
+        win.mainloop()
 
 
-def _load_photo(path: Path, max_side: int) -> tk.PhotoImage | None:
+def _load_photo(
+    path: Path,
+    max_side: int,
+    master: tk.Misc,
+) -> tk.PhotoImage | None:
+    """Load a sprite into the given Tk window (master must own the overlay)."""
     if not path.is_file():
         return None
     try:
         from PIL import Image, ImageTk
     except ImportError:
-        return tk.PhotoImage(file=str(path))
+        return tk.PhotoImage(file=str(path), master=master)
 
     img = Image.open(path).convert("RGBA")
     w, h = img.size
@@ -156,54 +225,48 @@ def _load_photo(path: Path, max_side: int) -> tk.PhotoImage | None:
             (max(1, int(w * scale)), max(1, int(h * scale))),
             Image.Resampling.LANCZOS,
         )
-    return ImageTk.PhotoImage(img)
+    return ImageTk.PhotoImage(img, master=master)
 
 
-def _load_cat_kit(max_side: int) -> dict[str, list[tk.PhotoImage]]:
-    """Load walk / stretch / lie sprite frames."""
+def _load_cat_kit(
+    max_side: int,
+    master: tk.Misc,
+) -> dict[str, list[tk.PhotoImage]]:
+    """Load walk / stretch / lie sprite frames for a specific Tk window."""
     kit: dict[str, list[tk.PhotoImage]] = {"walk": [], "stretch": [], "lie": []}
 
     for pose, names in CAT_FRAMES.items():
         for name in names:
-            photo = _load_photo(ASSETS_DIR / name, max_side)
+            photo = _load_photo(ASSETS_DIR / name, max_side, master)
             if photo is not None:
                 kit[pose].append(photo)
 
     return kit
 
 
-def long_break(duration_seconds: float = LONG_BREAK_SECONDS) -> None:
-    """Block the screen; cat walks in, stretches, lies down, then leaves.
-
-    Uses an opaque warm backdrop from the start so neither the desktop nor a
-    chroma-key color can bleed into the cat.
-    """
+def long_break(
+    duration_seconds: float = LONG_BREAK_SECONDS,
+    master: tk.Misc | None = None,
+    done: threading.Event | None = None,
+) -> None:
+    """Block the screen; cat walks in, stretches, lies down, then leaves."""
     x, y, width, height = virtual_screen_bounds()
     frame_ms = max(1, int(1000 / FPS))
 
-    # Warm charcoal — complements cream fur; opaque so colors stay true
     BG = "#1c1916"
     FLOOR = "#2a2520"
-    root = tk.Tk()
-    root.title("EyeRest - long break")
-    root.overrideredirect(True)
-    root.attributes("-topmost", True)
-    root.configure(bg=BG)
-    root.geometry(f"{width}x{height}+{x}+{y}")
-    root.attributes("-alpha", 1.0)
-    root.focus_force()
+    win, owns_loop = _make_overlay(master, "EyeRest - long break", BG)
+    win.attributes("-alpha", 1.0)
 
     canvas = tk.Canvas(
-        root,
+        win,
         width=width,
         height=height,
         bg=BG,
         highlightthickness=0,
     )
     canvas.pack(fill="both", expand=True)
-    background = canvas.create_rectangle(
-        0, 0, width, height, fill=BG, outline=""
-    )
+    canvas.create_rectangle(0, 0, width, height, fill=BG, outline="")
 
     rest_x = width * 0.75
     rest_y = height * 0.58
@@ -211,9 +274,8 @@ def long_break(duration_seconds: float = LONG_BREAK_SECONDS) -> None:
     exit_x = -260
     cat_size = min(480, int(min(width, height) * 0.48))
 
-    # Soft floor shadow under the resting spot
     floor_y = height * 0.72
-    floor_shadow = canvas.create_oval(
+    canvas.create_oval(
         rest_x - width * 0.16,
         floor_y - 28,
         rest_x + width * 0.16,
@@ -222,11 +284,18 @@ def long_break(duration_seconds: float = LONG_BREAK_SECONDS) -> None:
         outline="",
     )
 
-    kit = _load_cat_kit(cat_size)
-    # Prevent GC of PhotoImage refs
-    root._cat_kit = kit  # type: ignore[attr-defined]
+    kit = _load_cat_kit(cat_size, master=win)
+    win._cat_kit = kit  # type: ignore[attr-defined]
 
-    if not any(kit.values()):
+    finished = {"value": False}
+
+    def finish() -> None:
+        if finished["value"]:
+            return
+        finished["value"] = True
+        close_overlay(win, done)
+
+    if not kit["walk"]:
         canvas.create_text(
             width / 2,
             height / 2,
@@ -234,8 +303,9 @@ def long_break(duration_seconds: float = LONG_BREAK_SECONDS) -> None:
             fill="#f7e8d8",
             font=("Segoe UI", 22),
         )
-        root.after(2000, root.destroy)
-        root.mainloop()
+        win.after(2000, finish)
+        if owns_loop:
+            win.mainloop()
         return
 
     first = kit["walk"][0]
@@ -275,7 +345,6 @@ def long_break(duration_seconds: float = LONG_BREAK_SECONDS) -> None:
     )
 
     state = {
-        # walk -> stretch -> lie_down -> rest -> exit -> done
         "phase": "walk",
         "phase_t0": time.perf_counter(),
         "cat_x": float(start_x),
@@ -301,7 +370,7 @@ def long_break(duration_seconds: float = LONG_BREAK_SECONDS) -> None:
         canvas.coords(cat_id, nx, ny + bob)
 
     def begin_exit(_event: object | None = None) -> None:
-        if state["phase"] in ("exit", "done"):
+        if state["phase"] in ("exit", "done") or finished["value"]:
             return
         state["exit_from_x"] = state["cat_x"]
         state["phase"] = "exit"
@@ -310,144 +379,303 @@ def long_break(duration_seconds: float = LONG_BREAK_SECONDS) -> None:
         canvas.itemconfigure(hint, text="Okay... walking away...")
         canvas.itemconfigure(subtitle, text="See you after a few more blinks.")
 
-    root.bind("<Escape>", begin_exit)
+    win.bind("<Escape>", begin_exit)
 
     def format_mmss(seconds: float) -> str:
         secs = max(0, int(math.ceil(seconds)))
         return f"{secs // 60}:{secs % 60:02d} left"
 
     def tick() -> None:
+        if finished["value"]:
+            return
         if state["phase"] == "done":
-            root.destroy()
+            finish()
             return
 
         now = time.perf_counter()
         elapsed = now - state["phase_t0"]
 
-        if state["phase"] == "walk":
-            t = ease_in_out(min(1.0, elapsed / WALK_SECONDS))
-            nx = start_x + (rest_x - start_x) * t
-            # Walk bob + alternate stride frames
-            bob = abs(math.sin(elapsed * WALK_FRAME_HZ * math.pi)) * 8
-            frame_i = int(elapsed * WALK_FRAME_HZ) % max(1, len(kit["walk"]))
-            set_pose("walk", frame_i)
-            place_cat(nx, rest_y, bob)
-            canvas.itemconfigure(subtitle, text="Walking over to rest with you...")
-            canvas.itemconfigure(timer_text, text=format_mmss(duration_seconds))
-            if elapsed >= WALK_SECONDS:
-                place_cat(rest_x, rest_y, 0)
-                state["phase"] = "stretch"
-                state["phase_t0"] = now
-                set_pose("stretch")
-                canvas.itemconfigure(subtitle, text="Big stretch...")
+        try:
+            if state["phase"] == "walk":
+                t = ease_in_out(min(1.0, elapsed / WALK_SECONDS))
+                nx = start_x + (rest_x - start_x) * t
+                bob = abs(math.sin(elapsed * WALK_FRAME_HZ * math.pi)) * 8
+                frame_i = int(elapsed * WALK_FRAME_HZ) % max(1, len(kit["walk"]))
+                set_pose("walk", frame_i)
+                place_cat(nx, rest_y, bob)
+                canvas.itemconfigure(subtitle, text="Walking over to rest with you...")
+                canvas.itemconfigure(timer_text, text=format_mmss(duration_seconds))
+                if elapsed >= WALK_SECONDS:
+                    place_cat(rest_x, rest_y, 0)
+                    state["phase"] = "stretch"
+                    state["phase_t0"] = now
+                    set_pose("stretch")
+                    canvas.itemconfigure(subtitle, text="Big stretch...")
 
-        elif state["phase"] == "stretch":
-            # Settle forward a little during stretch
-            t = ease_in_out(min(1.0, elapsed / STRETCH_SECONDS))
-            bob = math.sin(t * math.pi) * -12  # dips into the stretch
-            place_cat(rest_x, rest_y, bob)
-            canvas.itemconfigure(timer_text, text=format_mmss(duration_seconds))
-            if elapsed >= STRETCH_SECONDS:
-                state["phase"] = "lie_down"
-                state["phase_t0"] = now
+            elif state["phase"] == "stretch":
+                t = ease_in_out(min(1.0, elapsed / STRETCH_SECONDS))
+                bob = math.sin(t * math.pi) * -12
+                place_cat(rest_x, rest_y, bob)
+                canvas.itemconfigure(timer_text, text=format_mmss(duration_seconds))
+                if elapsed >= STRETCH_SECONDS:
+                    state["phase"] = "lie_down"
+                    state["phase_t0"] = now
+                    set_pose("lie")
+                    canvas.itemconfigure(subtitle, text="Lying down...")
+
+            elif state["phase"] == "lie_down":
+                t = ease_in_out(min(1.0, elapsed / LIE_SECONDS))
+                bob = (1.0 - t) * 18
+                place_cat(rest_x, rest_y + 10 * t, bob)
+                canvas.itemconfigure(timer_text, text=format_mmss(duration_seconds))
+                if elapsed >= LIE_SECONDS:
+                    place_cat(rest_x, rest_y + 10, 0)
+                    state["phase"] = "rest"
+                    state["phase_t0"] = now
+                    canvas.itemconfigure(
+                        subtitle,
+                        text="Your cat is resting. Stretch, look away, breathe.",
+                    )
+
+            elif state["phase"] == "rest":
                 set_pose("lie")
-                canvas.itemconfigure(subtitle, text="Lying down...")
+                bob = math.sin(elapsed * 1.15) * 3.5
+                place_cat(rest_x, rest_y + 10, bob)
+                remaining = duration_seconds - elapsed
+                canvas.itemconfigure(timer_text, text=format_mmss(remaining))
+                if remaining <= 0:
+                    state["exit_from_x"] = state["cat_x"]
+                    state["phase"] = "exit"
+                    state["phase_t0"] = now
+                    set_pose("walk", 0)
+                    canvas.itemconfigure(hint, text="Break over - off the cat goes...")
+                    canvas.itemconfigure(subtitle, text="Nice rest. Back to it gently.")
 
-        elif state["phase"] == "lie_down":
-            t = ease_in_out(min(1.0, elapsed / LIE_SECONDS))
-            # Soft drop into resting pose
-            bob = (1.0 - t) * 18
-            place_cat(rest_x, rest_y + 10 * t, bob)
-            canvas.itemconfigure(timer_text, text=format_mmss(duration_seconds))
-            if elapsed >= LIE_SECONDS:
-                place_cat(rest_x, rest_y + 10, 0)
-                state["phase"] = "rest"
-                state["phase_t0"] = now
-                canvas.itemconfigure(
-                    subtitle,
-                    text="Your cat is resting. Stretch, look away, breathe.",
-                )
-
-        elif state["phase"] == "rest":
-            set_pose("lie")
-            # Gentle breathing
-            bob = math.sin(elapsed * 1.15) * 3.5
-            place_cat(rest_x, rest_y + 10, bob)
-            remaining = duration_seconds - elapsed
-            canvas.itemconfigure(timer_text, text=format_mmss(remaining))
-            if remaining <= 0:
-                state["exit_from_x"] = state["cat_x"]
-                state["phase"] = "exit"
-                state["phase_t0"] = now
-                set_pose("walk", 0)
-                canvas.itemconfigure(hint, text="Break over - off the cat goes...")
-                canvas.itemconfigure(subtitle, text="Nice rest. Back to it gently.")
-
-        elif state["phase"] == "exit":
-            t = ease_in_out(min(1.0, elapsed / WALK_SECONDS))
-            from_x = state["exit_from_x"]
-            nx = from_x + (exit_x - from_x) * t
-            bob = abs(math.sin(elapsed * WALK_FRAME_HZ * math.pi)) * 8
-            frame_i = int(elapsed * WALK_FRAME_HZ) % max(1, len(kit["walk"]))
-            set_pose("walk", frame_i)
-            place_cat(nx, rest_y, bob)
-            if elapsed >= WALK_SECONDS:
-                state["phase"] = "done"
-                root.destroy()
-                return
+            elif state["phase"] == "exit":
+                t = ease_in_out(min(1.0, elapsed / WALK_SECONDS))
+                from_x = state["exit_from_x"]
+                nx = from_x + (exit_x - from_x) * t
+                bob = abs(math.sin(elapsed * WALK_FRAME_HZ * math.pi)) * 8
+                frame_i = int(elapsed * WALK_FRAME_HZ) % max(1, len(kit["walk"]))
+                set_pose("walk", frame_i)
+                place_cat(nx, rest_y, bob)
+                if elapsed >= WALK_SECONDS:
+                    state["phase"] = "done"
+                    finish()
+                    return
+        except tk.TclError:
+            finish()
+            return
 
         _ = message
-        root.after(frame_ms, tick)
+        win.after(frame_ms, tick)
 
-    root.after(0, tick)
-    root.mainloop()
+    win.after(0, tick)
+    if owns_loop:
+        win.mainloop()
 
 
-class TimerPanel:
-    """Small top-left countdown panel shared safely with the reminder loop."""
+class EyeRestApp:
+    """Single-Tk app: timer panel on the main thread, overlays as Toplevels."""
 
-    def __init__(self, interval_seconds: float) -> None:
+    def __init__(
+        self,
+        interval_seconds: float,
+        fade_seconds: float,
+        long_break_seconds: float,
+        long_break_every: int,
+        demo_first: bool,
+    ) -> None:
         self.interval_seconds = interval_seconds
+        self.fade_seconds = fade_seconds
+        self.long_break_seconds = long_break_seconds
+        self.long_break_every = max(1, long_break_every)
+        self.demo_first = demo_first
+
         self._deadline = time.monotonic() + interval_seconds
+        self._paused = False
+        self._remaining_when_paused = 0.0
+        self._blink_count = 0
         self._lock = threading.Lock()
-        self._reset_event = threading.Event()
-        self._thread = threading.Thread(
-            target=self._run_window,
-            name="EyeRest timer panel",
+        self._wake_event = threading.Event()
+        self._busy = False
+
+        self.root = tk.Tk()
+        self.root.title("EyeRest timer")
+        self.root.attributes("-topmost", True)
+        self.root.resizable(False, False)
+        panel_x, panel_y = primary_monitor_origin()
+        self.root.geometry(f"+{panel_x}+{panel_y}")
+        self.root.configure(bg="#25211d")
+        self.root.protocol("WM_DELETE_WINDOW", self.root.iconify)
+
+        self._build_panel()
+
+        self._worker = threading.Thread(
+            target=self._reminder_loop,
+            name="EyeRest reminder loop",
             daemon=True,
         )
-        self._thread.start()
+        self._worker.start()
+
+    def set_blink_count(self, blink_count: int) -> None:
+        with self._lock:
+            self._blink_count = blink_count
+
+    def blink_count(self) -> int:
+        with self._lock:
+            return self._blink_count
+
+    def current_phase(self) -> int:
+        """1-based place in the cycle. Phase 1 = 3 shorts then cat; last = cat next."""
+        with self._lock:
+            return (self._blink_count % self.long_break_every) + 1
+
+    def set_phase(self, phase: int) -> None:
+        """Jump the cycle so the upcoming sessions match this phase."""
+        cycle = self.long_break_every
+        phase = max(1, min(cycle, int(phase)))
+        with self._lock:
+            completed_in_cycle = phase - 1
+            base = self._blink_count - (self._blink_count % cycle)
+            self._blink_count = base + completed_in_cycle
+
+    def start_now(self) -> None:
+        with self._lock:
+            self._paused = False
+            self._remaining_when_paused = 0.0
+            self._deadline = time.monotonic()
+        self._wake_event.set()
+
+    def consume_next_session(self) -> str:
+        with self._lock:
+            self._blink_count += 1
+            if self._blink_count % self.long_break_every == 0:
+                return SESSION_LONG
+            return SESSION_BLINK
+
+    def planned_next_session(self) -> str:
+        with self._lock:
+            upcoming = self._blink_count + 1
+            if upcoming % self.long_break_every == 0:
+                return SESSION_LONG
+            return SESSION_BLINK
 
     def reset(self) -> None:
-        """Postpone the next reminder by one full interval."""
         with self._lock:
+            self._paused = False
+            self._remaining_when_paused = 0.0
             self._deadline = time.monotonic() + self.interval_seconds
-        self._reset_event.set()
+        self._wake_event.set()
+
+    def pause(self) -> None:
+        with self._lock:
+            if self._paused:
+                return
+            self._remaining_when_paused = max(0.0, self._deadline - time.monotonic())
+            self._paused = True
+        self._wake_event.set()
+
+    def resume(self) -> None:
+        with self._lock:
+            if not self._paused:
+                return
+            self._deadline = time.monotonic() + self._remaining_when_paused
+            self._paused = False
+            self._remaining_when_paused = 0.0
+        self._wake_event.set()
+
+    def toggle_pause(self) -> None:
+        if self.is_paused():
+            self.resume()
+        else:
+            self.pause()
+
+    def is_paused(self) -> bool:
+        with self._lock:
+            return self._paused
 
     def seconds_remaining(self) -> float:
         with self._lock:
+            if self._paused:
+                return max(0.0, self._remaining_when_paused)
             return max(0.0, self._deadline - time.monotonic())
 
     def wait_until_due(self) -> None:
-        """Wait for the deadline, waking immediately when Reset is clicked."""
         while True:
-            remaining = self.seconds_remaining()
-            if remaining <= 0:
+            with self._lock:
+                paused = self._paused
+                remaining = (
+                    self._remaining_when_paused
+                    if paused
+                    else self._deadline - time.monotonic()
+                )
+            if not paused and remaining <= 0:
                 return
-            self._reset_event.wait(timeout=min(remaining, 0.25))
-            self._reset_event.clear()
+            timeout = 0.25 if paused else min(max(remaining, 0.0), 0.25)
+            self._wake_event.wait(timeout=timeout)
+            self._wake_event.clear()
 
-    def _run_window(self) -> None:
-        root = tk.Tk()
-        root.title("EyeRest timer")
-        root.attributes("-topmost", True)
-        root.resizable(False, False)
-        panel_x, panel_y = primary_monitor_origin()
-        root.geometry(f"+{panel_x}+{panel_y}")
-        root.configure(bg="#25211d")
-        root.protocol("WM_DELETE_WINDOW", root.iconify)
+    def _run_session_on_ui(self, session: str) -> None:
+        """Run blink/long-break on the Tk thread as a Toplevel, wait until done."""
+        done = threading.Event()
 
-        frame = tk.Frame(root, bg="#25211d", padx=12, pady=10)
+        def start() -> None:
+            if session == SESSION_LONG:
+                long_break(self.long_break_seconds, master=self.root, done=done)
+            else:
+                blink(self.fade_seconds, master=self.root, done=done)
+
+        self.root.after(0, start)
+        done.wait()
+
+    def _reminder_loop(self) -> None:
+        try:
+            if self.demo_first:
+                print("Demo blink in 2 seconds...")
+                time.sleep(2)
+                self._run_session_on_ui(SESSION_BLINK)
+                self.set_blink_count(1)
+                self.reset()
+                print(
+                    "Next event in "
+                    f"{self.interval_seconds / 60:.0f} minutes "
+                    f"({time.strftime('%H:%M:%S', time.localtime(time.time() + self.interval_seconds))})."
+                )
+
+            while True:
+                self.wait_until_due()
+                if self._busy:
+                    time.sleep(0.2)
+                    continue
+                self._busy = True
+                try:
+                    session = self.consume_next_session()
+                    count = self.blink_count()
+                    stamp = time.strftime("%H:%M:%S")
+
+                    if session == SESSION_LONG:
+                        print(f"[{stamp}] Long break - cat is coming to rest...")
+                    else:
+                        print(
+                            f"[{stamp}] Rest your eyes - blinking "
+                            f"({count % self.long_break_every}/"
+                            f"{self.long_break_every} until long break)..."
+                        )
+                    self._run_session_on_ui(session)
+                    self.reset()
+                    next_at = time.time() + self.interval_seconds
+                    print(
+                        "Next event at "
+                        f"{time.strftime('%H:%M:%S', time.localtime(next_at))}."
+                    )
+                finally:
+                    self._busy = False
+        except Exception as exc:  # noqa: BLE001 - keep panel alive, log the failure
+            print(f"EyeRest reminder loop error: {exc}")
+
+    def _build_panel(self) -> None:
+        frame = tk.Frame(self.root, bg="#25211d", padx=12, pady=10)
         frame.pack()
         title = tk.Label(
             frame,
@@ -465,7 +693,25 @@ class TimerPanel:
             font=("Segoe UI Semibold", 18),
             cursor="fleur",
         )
-        countdown.pack(anchor="w", pady=(0, 4))
+        countdown.pack(anchor="w", pady=(0, 2))
+        next_label = tk.Label(
+            frame,
+            text="",
+            bg="#25211d",
+            fg="#d9c8b6",
+            font=("Segoe UI", 9),
+            cursor="fleur",
+        )
+        next_label.pack(anchor="w")
+        status = tk.Label(
+            frame,
+            text="",
+            bg="#25211d",
+            fg="#c9a46c",
+            font=("Segoe UI", 8),
+            cursor="fleur",
+        )
+        status.pack(anchor="w")
         drag_hint = tk.Label(
             frame,
             text="Drag to move",
@@ -474,108 +720,146 @@ class TimerPanel:
             font=("Segoe UI", 8),
             cursor="fleur",
         )
-        drag_hint.pack(anchor="w", pady=(0, 7))
+        drag_hint.pack(anchor="w", pady=(0, 8))
+
+        button_style = {
+            "fg": "#ffffff",
+            "activeforeground": "#ffffff",
+            "relief": "flat",
+            "padx": 10,
+            "pady": 4,
+            "font": ("Segoe UI Semibold", 9),
+            "cursor": "hand2",
+        }
+
+        cycle = self.long_break_every
+        cycle_grid = tk.Frame(frame, bg="#25211d")
+        cycle_grid.pack(fill="x", pady=(0, 6))
+        cols = 2 if cycle > 2 else cycle
+        phase_buttons: dict[int, tk.Button] = {}
+        for phase in range(1, cycle + 1):
+            shorts_left = cycle - phase
+            label = "Cat next" if shorts_left <= 0 else f"{shorts_left} then cat"
+            btn = tk.Button(
+                cycle_grid,
+                text=label,
+                command=lambda p=phase: self.set_phase(p),
+                bg="#5a6b7a",
+                activebackground="#6f8294",
+                **button_style,
+            )
+            row, col = divmod(phase - 1, cols)
+            last_row = (cycle - 1) // cols
+            padx = (0, 3) if col < cols - 1 else (0, 0)
+            pady = (0, 3) if row < last_row else (0, 0)
+            btn.grid(row=row, column=col, sticky="ew", padx=padx, pady=pady)
+            phase_buttons[phase] = btn
+        for col in range(cols):
+            cycle_grid.columnconfigure(col, weight=1)
+
+        tk.Button(
+            frame,
+            text="Start now",
+            command=self.start_now,
+            bg="#8b5e3c",
+            activebackground="#a47149",
+            **button_style,
+        ).pack(fill="x", pady=(0, 6))
+
+        pause_btn = tk.Button(
+            frame,
+            text="Pause",
+            command=self.toggle_pause,
+            bg="#5a6b7a",
+            activebackground="#6f8294",
+            **button_style,
+        )
+        pause_btn.pack(fill="x", pady=(0, 6))
+
         reset_minutes = max(1, int(round(self.interval_seconds / 60)))
         tk.Button(
             frame,
             text=f"Reset {reset_minutes} min",
             command=self.reset,
             bg="#c77d4f",
-            fg="#ffffff",
             activebackground="#dc9568",
-            activeforeground="#ffffff",
-            relief="flat",
-            padx=10,
-            pady=4,
-            font=("Segoe UI Semibold", 9),
-            cursor="hand2",
+            **button_style,
         ).pack(fill="x")
 
         drag_offset = {"x": 0, "y": 0}
 
         def start_drag(event: tk.Event) -> None:
-            drag_offset["x"] = event.x_root - root.winfo_x()
-            drag_offset["y"] = event.y_root - root.winfo_y()
+            drag_offset["x"] = event.x_root - self.root.winfo_x()
+            drag_offset["y"] = event.y_root - self.root.winfo_y()
 
         def on_drag(event: tk.Event) -> None:
-            root.geometry(
+            self.root.geometry(
                 f"+{event.x_root - drag_offset['x']}+{event.y_root - drag_offset['y']}"
             )
 
-        for widget in (root, frame, title, countdown, drag_hint):
+        for widget in (self.root, frame, title, countdown, next_label, status, drag_hint):
             widget.bind("<ButtonPress-1>", start_drag)
             widget.bind("<B1-Motion>", on_drag)
 
+        def session_caption(session: str, phase: int) -> str:
+            shorts_left = self.long_break_every - phase
+            if session == SESSION_LONG:
+                return "Next: Cat break"
+            if shorts_left == 1:
+                return "Next: Short blink, then cat"
+            return f"Next: Short blink · {shorts_left} then cat"
+
         def update_countdown() -> None:
             seconds = int(math.ceil(self.seconds_remaining()))
+            paused = self.is_paused()
+            session = self.planned_next_session()
+            phase = self.current_phase()
             countdown.config(text=f"{seconds // 60:02d}:{seconds % 60:02d}")
-            root.after(250, update_countdown)
+            next_label.config(text=session_caption(session, phase))
+
+            selected_bg = "#3f7a5a"
+            selected_active = "#4f956c"
+            idle_bg = "#5a6b7a"
+            idle_active = "#6f8294"
+            for p, btn in phase_buttons.items():
+                selected = p == phase
+                btn.config(
+                    bg=selected_bg if selected else idle_bg,
+                    activebackground=selected_active if selected else idle_active,
+                )
+
+            if paused:
+                status.config(text="Paused")
+                pause_btn.config(text="Resume", bg="#3f7a5a", activebackground="#4f956c")
+                countdown.config(fg="#c9a46c")
+            else:
+                status.config(text="")
+                pause_btn.config(text="Pause", bg="#5a6b7a", activebackground="#6f8294")
+                countdown.config(fg="#fff4e8")
+            self.root.after(250, update_countdown)
 
         update_countdown()
-        root.mainloop()
 
-
-def run_loop(
-    interval_seconds: float,
-    fade_seconds: float,
-    long_break_seconds: float,
-    long_break_every: int,
-    demo_first: bool,
-) -> None:
-    print("EyeRest is running.")
-    print(f"  Interval    : every {interval_seconds / 60:.0f} minutes")
-    print(f"  Blink       : {fade_seconds:.1f}s fade to black and back")
-    print(
-        f"  Long break  : every {long_break_every}th blink, cat rests "
-        f"{long_break_seconds / 60:.0f} minutes"
-    )
-    print("  Press Escape during a blink to skip it.")
-    print("  Press Escape during a long break to send the cat away.")
-    print("  The top-left timer panel can reset the next reminder.")
-    print("  Press Ctrl+C in this window to quit.\n")
-
-    blink_count = 0
-    timer_panel = TimerPanel(interval_seconds)
-
-    try:
-        if demo_first:
-            print("Demo blink in 2 seconds...")
-            time.sleep(2)
-            blink(fade_seconds)
-            blink_count = 1
-            timer_panel.reset()
-            print(
-                "Next event in "
-                f"{interval_seconds / 60:.0f} minutes "
-                f"({time.strftime('%H:%M:%S', time.localtime(time.time() + interval_seconds))})."
-            )
-
-        while True:
-            timer_panel.wait_until_due()
-            blink_count += 1
-            stamp = time.strftime("%H:%M:%S")
-
-            if blink_count % long_break_every == 0:
-                print(
-                    f"[{stamp}] Long break #{blink_count // long_break_every} "
-                    f"- cat is coming to rest..."
-                )
-                long_break(long_break_seconds)
-            else:
-                print(
-                    f"[{stamp}] Rest your eyes - blinking "
-                    f"({blink_count % long_break_every}/{long_break_every} until long break)..."
-                )
-                blink(fade_seconds)
-
-            timer_panel.reset()
-            next_at = time.time() + interval_seconds
-            print(
-                "Next event at "
-                f"{time.strftime('%H:%M:%S', time.localtime(next_at))}."
-            )
-    except KeyboardInterrupt:
-        print("\nEyeRest stopped.")
+    def run(self) -> None:
+        print("EyeRest is running.")
+        print(f"  Interval    : every {self.interval_seconds / 60:.0f} minutes")
+        print(f"  Blink       : {self.fade_seconds:.1f}s fade to black and back")
+        print(
+            f"  Long break  : every {self.long_break_every}th blink, cat rests "
+            f"{self.long_break_seconds / 60:.0f} minutes"
+        )
+        print("  Press Escape during a blink to skip it.")
+        print("  Press Escape during a long break to send the cat away.")
+        print("  Use the panel to jump to a cycle phase, or Start now.")
+        print("  Press Ctrl+C in this window to quit.\n")
+        try:
+            self.root.mainloop()
+        except KeyboardInterrupt:
+            print("\nEyeRest stopped.")
+            try:
+                self.root.destroy()
+            except tk.TclError:
+                pass
 
 
 def main() -> int:
@@ -631,13 +915,14 @@ def main() -> int:
         blink(args.fade)
         return 0
 
-    run_loop(
+    app = EyeRestApp(
         interval_seconds=max(0.1, args.interval) * 60,
         fade_seconds=max(0.5, args.fade),
         long_break_seconds=max(5.0, args.long_break * 60),
         long_break_every=max(1, args.every),
         demo_first=not args.no_demo,
     )
+    app.run()
     return 0
 
 
