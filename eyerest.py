@@ -4,6 +4,8 @@ as a gentle reminder to rest your eyes.
 
 Every 4th blink is a longer break: a realistic cat walks in, stretches,
 lies down for 5 minutes, then walks away (or sooner if you press Escape).
+A small heads-up appears 30 seconds before that overlay so you can save
+your work; the cat break itself still takes over the screen.
 """
 
 from __future__ import annotations
@@ -21,6 +23,8 @@ INTERVAL_SECONDS = 25 * 60
 FADE_SECONDS = 5.0
 LONG_BREAK_EVERY = 4
 LONG_BREAK_SECONDS = 5 * 60
+WARN_SECONDS = 30.0
+START_NOW_WARN_SECONDS = 5.0
 WALK_SECONDS = 5.0
 STRETCH_SECONDS = 2.2
 LIE_SECONDS = 1.4
@@ -55,6 +59,14 @@ MONITOR_DEFAULTTOPRIMARY = 1
 SPI_SETDESKWALLPAPER = 0x0014
 SPI_GETDESKWALLPAPER = 0x0073
 MAX_PATH = 260
+GWL_EXSTYLE = -20
+WS_EX_NOACTIVATE = 0x08000000
+WS_EX_TOOLWINDOW = 0x00000080
+SWP_NOSIZE = 0x0001
+SWP_NOMOVE = 0x0002
+SWP_NOACTIVATE = 0x0010
+SWP_FRAMECHANGED = 0x0020
+HWND_TOPMOST = ctypes.c_void_p(-1)
 
 
 class _RECT(ctypes.Structure):
@@ -96,6 +108,62 @@ def primary_monitor_origin(padding: int = 20) -> tuple[int, int]:
     return info.rcMonitor.left + padding, info.rcMonitor.top + padding
 
 
+def primary_work_area() -> tuple[int, int, int, int]:
+    """Primary monitor work area as (left, top, right, bottom)."""
+    user32 = ctypes.windll.user32
+    monitor = user32.MonitorFromWindow(None, MONITOR_DEFAULTTOPRIMARY)
+    info = _MONITORINFO()
+    info.cbSize = ctypes.sizeof(_MONITORINFO)
+    if not user32.GetMonitorInfoW(monitor, ctypes.byref(info)):
+        x, y = primary_monitor_origin(0)
+        return x, y, x + 1920, y + 1080
+    area = info.rcWork
+    return area.left, area.top, area.right, area.bottom
+
+
+def _foreground_hwnd() -> int:
+    user32 = ctypes.windll.user32
+    user32.GetForegroundWindow.restype = ctypes.c_void_p
+    hwnd = user32.GetForegroundWindow()
+    return int(hwnd) if hwnd else 0
+
+
+def _restore_foreground(hwnd: int) -> None:
+    if not hwnd:
+        return
+    ctypes.windll.user32.SetForegroundWindow(hwnd)
+
+
+def _apply_no_activate(win: tk.Misc) -> None:
+    """Keep a topmost popup from stealing keyboard focus (Windows)."""
+    user32 = ctypes.windll.user32
+    user32.GetParent.restype = ctypes.c_void_p
+    user32.GetParent.argtypes = [ctypes.c_void_p]
+    user32.SetWindowPos.restype = ctypes.c_int
+    user32.SetWindowPos.argtypes = [
+        ctypes.c_void_p,
+        ctypes.c_void_p,
+        ctypes.c_int,
+        ctypes.c_int,
+        ctypes.c_int,
+        ctypes.c_int,
+        ctypes.c_uint,
+    ]
+    widget = int(win.winfo_id())
+    hwnd = int(user32.GetParent(widget) or widget)
+    style = user32.GetWindowLongW(hwnd, GWL_EXSTYLE)
+    user32.SetWindowLongW(hwnd, GWL_EXSTYLE, style | WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW)
+    user32.SetWindowPos(
+        hwnd,
+        HWND_TOPMOST,
+        0,
+        0,
+        0,
+        0,
+        SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_FRAMECHANGED,
+    )
+
+
 def ease_in_out(t: float) -> float:
     t = max(0.0, min(1.0, t))
     return t * t * (3.0 - 2.0 * t)
@@ -132,6 +200,104 @@ def close_overlay(win: tk.Misc, done: threading.Event | None = None) -> None:
     refresh_desktop()
     if done is not None:
         done.set()
+
+
+class CatBreakWarning:
+    """Small non-activating corner toast; does not block the rest of the desktop."""
+
+    WIDTH = 368
+    HEIGHT = 132
+    PAD = 16
+
+    def __init__(
+        self,
+        master: tk.Misc,
+        remaining_fn: object,
+        break_seconds: float,
+    ) -> None:
+        self._remaining_fn = remaining_fn
+        self._closed = False
+        previous = _foreground_hwnd()
+        self.win = tk.Toplevel(master)
+        self.win.overrideredirect(True)
+        self.win.attributes("-topmost", True)
+        self.win.configure(bg="#25211d")
+        self.win.resizable(False, False)
+
+        frame = tk.Frame(self.win, bg="#25211d", padx=14, pady=12)
+        frame.pack(fill="both", expand=True)
+        self._countdown = tk.Label(
+            frame,
+            text="",
+            bg="#25211d",
+            fg="#fff4e8",
+            font=("Segoe UI Semibold", 16),
+            anchor="w",
+        )
+        self._countdown.pack(anchor="w")
+        tk.Label(
+            frame,
+            text="The screen will go dark for a cat break.",
+            bg="#25211d",
+            fg="#f3ebe3",
+            font=("Segoe UI", 10),
+            anchor="w",
+        ).pack(anchor="w", pady=(4, 0))
+        minutes = max(1, int(round(break_seconds / 60)))
+        tk.Label(
+            frame,
+            text=f"Save your work. About {minutes} min once it starts. Click to dismiss.",
+            bg="#25211d",
+            fg="#c4b5a5",
+            font=("Segoe UI", 9),
+            anchor="w",
+            wraplength=self.WIDTH - 36,
+            justify="left",
+        ).pack(anchor="w", pady=(2, 0))
+
+        self._place()
+        self.win.update_idletasks()
+        try:
+            _apply_no_activate(self.win)
+        except (tk.TclError, OSError, AttributeError):
+            pass
+        _restore_foreground(previous)
+
+        def bind_dismiss(widget: tk.Misc) -> None:
+            widget.bind("<Button-1>", lambda _event: self.destroy())
+            for child in widget.winfo_children():
+                bind_dismiss(child)
+
+        bind_dismiss(self.win)
+        self._tick()
+
+    def _place(self) -> None:
+        left, top, right, bottom = primary_work_area()
+        x = right - self.WIDTH - self.PAD
+        y = bottom - self.HEIGHT - self.PAD
+        x = max(left + self.PAD, x)
+        y = max(top + self.PAD, y)
+        self.win.geometry(f"{self.WIDTH}x{self.HEIGHT}+{x}+{y}")
+
+    def _tick(self) -> None:
+        if self._closed:
+            return
+        try:
+            remaining = float(self._remaining_fn())  # type: ignore[operator]
+            secs = max(0, int(math.ceil(remaining)))
+            self._countdown.config(text=f"Cat break in {secs // 60}:{secs % 60:02d}")
+        except tk.TclError:
+            return
+        self.win.after(200, self._tick)
+
+    def destroy(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        try:
+            self.win.destroy()
+        except tk.TclError:
+            pass
 
 
 def _make_overlay(
@@ -485,12 +651,14 @@ class EyeRestApp:
         long_break_seconds: float,
         long_break_every: int,
         demo_first: bool,
+        warn_seconds: float = WARN_SECONDS,
     ) -> None:
         self.interval_seconds = interval_seconds
         self.fade_seconds = fade_seconds
         self.long_break_seconds = long_break_seconds
         self.long_break_every = max(1, long_break_every)
         self.demo_first = demo_first
+        self.warn_seconds = max(0.0, warn_seconds)
 
         self._deadline = time.monotonic() + interval_seconds
         self._paused = False
@@ -499,6 +667,8 @@ class EyeRestApp:
         self._lock = threading.Lock()
         self._wake_event = threading.Event()
         self._busy = False
+        self._warning: CatBreakWarning | None = None
+        self._warning_logged = False
 
         self.root = tk.Tk()
         self.root.title("EyeRest timer")
@@ -539,6 +709,7 @@ class EyeRestApp:
             completed_in_cycle = phase - 1
             base = self._blink_count - (self._blink_count % cycle)
             self._blink_count = base + completed_in_cycle
+        self._wake_event.set()
 
     def start_now(self) -> None:
         with self._lock:
@@ -616,11 +787,60 @@ class EyeRestApp:
             self._wake_event.wait(timeout=timeout)
             self._wake_event.clear()
 
+    def _wait_seconds_or_wake(self, seconds: float) -> None:
+        deadline = time.monotonic() + max(0.0, seconds)
+        while True:
+            left = deadline - time.monotonic()
+            if left <= 0 or self.is_paused():
+                return
+            if self.seconds_remaining() > seconds + 0.5:
+                return
+            self._wake_event.wait(timeout=min(left, 0.25))
+            self._wake_event.clear()
+
+    def _open_warning_widget(self) -> None:
+        if self._warning is not None:
+            try:
+                if self._warning.win.winfo_exists():
+                    return
+            except tk.TclError:
+                self._warning = None
+        self._warning = CatBreakWarning(
+            self.root,
+            remaining_fn=self.seconds_remaining,
+            break_seconds=self.long_break_seconds,
+        )
+
+    def _close_warning_widget(self) -> None:
+        warning = self._warning
+        self._warning = None
+        if warning is not None:
+            warning.destroy()
+
+    def _show_cat_warning(self) -> None:
+        remaining = self.seconds_remaining()
+        lead = remaining if remaining > 0.05 else min(self.warn_seconds, START_NOW_WARN_SECONDS)
+        if not self._warning_logged:
+            self._warning_logged = True
+            secs = max(1, int(math.ceil(lead)))
+            print(
+                f"[{time.strftime('%H:%M:%S')}] Cat break in {secs}s — "
+                "screen will go dark."
+            )
+        self.root.after(0, self._open_warning_widget)
+
+    def _hide_cat_warning(self) -> None:
+        if not self._warning_logged and self._warning is None:
+            return
+        self._warning_logged = False
+        self.root.after(0, self._close_warning_widget)
+
     def _run_session_on_ui(self, session: str) -> None:
         """Run blink/long-break on the Tk thread as a Toplevel, wait until done."""
         done = threading.Event()
 
         def start() -> None:
+            self._close_warning_widget()
             if session == SESSION_LONG:
                 long_break(self.long_break_seconds, master=self.root, done=done)
             else:
@@ -644,10 +864,46 @@ class EyeRestApp:
                 )
 
             while True:
-                self.wait_until_due()
                 if self._busy:
                     time.sleep(0.2)
                     continue
+
+                paused = self.is_paused()
+                remaining = self.seconds_remaining()
+                next_session = self.planned_next_session()
+                warn = self.warn_seconds if next_session == SESSION_LONG else 0.0
+
+                if paused:
+                    self._hide_cat_warning()
+                    self._wake_event.wait(timeout=0.25)
+                    self._wake_event.clear()
+                    continue
+
+                if next_session == SESSION_LONG and warn > 0 and remaining > 0.05:
+                    if remaining <= warn:
+                        self._show_cat_warning()
+                    else:
+                        self._hide_cat_warning()
+                    wait_for = remaining if remaining <= warn else remaining - warn
+                    self._wake_event.wait(timeout=min(max(wait_for, 0.0), 0.25))
+                    self._wake_event.clear()
+                    continue
+
+                if remaining > 0.05:
+                    self._hide_cat_warning()
+                    self._wake_event.wait(timeout=min(max(remaining, 0.0), 0.25))
+                    self._wake_event.clear()
+                    continue
+
+                if next_session == SESSION_LONG and warn > 0 and not self._warning_logged:
+                    self._show_cat_warning()
+                    self._wait_seconds_or_wake(min(warn, START_NOW_WARN_SECONDS))
+                    self._hide_cat_warning()
+                    if self.is_paused() or self.seconds_remaining() > 0.05:
+                        continue
+                    if self.planned_next_session() != SESSION_LONG:
+                        continue
+
                 self._busy = True
                 try:
                     session = self.consume_next_session()
@@ -671,6 +927,7 @@ class EyeRestApp:
                     )
                 finally:
                     self._busy = False
+                    self._hide_cat_warning()
         except Exception as exc:  # noqa: BLE001 - keep panel alive, log the failure
             print(f"EyeRest reminder loop error: {exc}")
 
@@ -832,6 +1089,14 @@ class EyeRestApp:
                 status.config(text="Paused")
                 pause_btn.config(text="Resume", bg="#3f7a5a", activebackground="#4f956c")
                 countdown.config(fg="#c9a46c")
+            elif (
+                session == SESSION_LONG
+                and self.warn_seconds > 0
+                and 0 < seconds <= int(math.ceil(self.warn_seconds))
+            ):
+                status.config(text="Cat break coming")
+                pause_btn.config(text="Pause", bg="#5a6b7a", activebackground="#6f8294")
+                countdown.config(fg="#fff4e8")
             else:
                 status.config(text="")
                 pause_btn.config(text="Pause", bg="#5a6b7a", activebackground="#6f8294")
@@ -848,6 +1113,11 @@ class EyeRestApp:
             f"  Long break  : every {self.long_break_every}th blink, cat rests "
             f"{self.long_break_seconds / 60:.0f} minutes"
         )
+        if self.warn_seconds > 0:
+            print(
+                f"  Heads-up    : {self.warn_seconds:.0f}s before each cat break "
+                "(does not steal focus)"
+            )
         print("  Press Escape during a blink to skip it.")
         print("  Press Escape during a long break to send the cat away.")
         print("  Use the panel to jump to a cycle phase, or Start now.")
@@ -860,6 +1130,51 @@ class EyeRestApp:
                 self.root.destroy()
             except tk.TclError:
                 pass
+
+
+def run_demo_long(duration_seconds: float, warn_seconds: float) -> None:
+    """One cat break, optionally preceded by the heads-up toast, then exit."""
+    if warn_seconds <= 0:
+        long_break(duration_seconds)
+        return
+
+    root = tk.Tk()
+    root.withdraw()
+    deadline = time.monotonic() + warn_seconds
+    print(
+        f"Cat break in {warn_seconds:.0f}s — screen will go dark. "
+        "You can keep using other windows until then."
+    )
+    warning = CatBreakWarning(
+        root,
+        remaining_fn=lambda: max(0.0, deadline - time.monotonic()),
+        break_seconds=duration_seconds,
+    )
+    finished = threading.Event()
+
+    def start_break() -> None:
+        warning.destroy()
+        print("Long break - cat is coming to rest...")
+        long_break(duration_seconds, master=root, done=finished)
+
+    def poll_finished() -> None:
+        if finished.is_set():
+            try:
+                root.destroy()
+            except tk.TclError:
+                pass
+            return
+        root.after(100, poll_finished)
+
+    root.after(max(1, int(warn_seconds * 1000)), start_break)
+    root.after(100, poll_finished)
+    try:
+        root.mainloop()
+    except KeyboardInterrupt:
+        try:
+            root.destroy()
+        except tk.TclError:
+            pass
 
 
 def main() -> int:
@@ -905,10 +1220,19 @@ def main() -> int:
         action="store_true",
         help="Skip the startup demo blink",
     )
+    parser.add_argument(
+        "--warn-seconds",
+        type=float,
+        default=WARN_SECONDS,
+        help="Seconds of heads-up before a cat break (default: 30; 0 disables)",
+    )
     args = parser.parse_args()
 
     if args.demo_long:
-        long_break(max(5.0, args.long_break * 60))
+        run_demo_long(
+            duration_seconds=max(5.0, args.long_break * 60),
+            warn_seconds=max(0.0, args.warn_seconds),
+        )
         return 0
 
     if args.once:
@@ -921,6 +1245,7 @@ def main() -> int:
         long_break_seconds=max(5.0, args.long_break * 60),
         long_break_every=max(1, args.every),
         demo_first=not args.no_demo,
+        warn_seconds=max(0.0, args.warn_seconds),
     )
     app.run()
     return 0
