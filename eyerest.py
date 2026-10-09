@@ -13,6 +13,7 @@ from __future__ import annotations
 import argparse
 import ctypes
 import math
+import os
 import sys
 import threading
 import time
@@ -62,15 +63,19 @@ WS_EX_LAYERED = 0x00080000
 WS_EX_TRANSPARENT = 0x00000020
 WS_EX_NOACTIVATE = 0x08000000
 WS_EX_TOOLWINDOW = 0x00000080
+WS_EX_TOPMOST = 0x00000008
 SWP_NOSIZE = 0x0001
 SWP_NOMOVE = 0x0002
 SWP_NOACTIVATE = 0x0010
+SWP_FRAMECHANGED = 0x0020
 GA_ROOT = 2
 VK_ESCAPE = 0x1B
 KEY_CURRENTLY_DOWN = 0x8000
-SW_SHOWNOACTIVATE = 4
+LWA_COLORKEY = 0x00000001
+LWA_ALPHA = 0x00000002
 HWND_TOPMOST = ctypes.c_void_p(-1)
 _USER32_READY = False
+_DEBUG = False
 
 # Color-key for the cat overlay: fully transparent on Windows, and very
 # unlikely to appear in the cat sprites themselves.
@@ -121,6 +126,16 @@ def ease_in_out(t: float) -> float:
     return t * t * (3.0 - 2.0 * t)
 
 
+def set_debug(enabled: bool) -> None:
+    global _DEBUG
+    _DEBUG = enabled
+
+
+def _debug(message: str) -> None:
+    if _DEBUG:
+        print(f"eyerest debug: {message}", file=sys.stderr, flush=True)
+
+
 def _configure_user32() -> None:
     """Pin HWND-sized ctypes signatures so 64-bit Windows handles stay intact."""
     global _USER32_READY
@@ -149,9 +164,82 @@ def _configure_user32() -> None:
     ]
     user32.GetAsyncKeyState.restype = ctypes.c_short
     user32.GetAsyncKeyState.argtypes = [ctypes.c_int]
-    user32.ShowWindow.argtypes = [ctypes.c_void_p, ctypes.c_int]
-    user32.ShowWindow.restype = ctypes.c_int
+    user32.SetLayeredWindowAttributes.argtypes = [
+        ctypes.c_void_p,
+        ctypes.c_uint32,
+        ctypes.c_ubyte,
+        ctypes.c_uint32,
+    ]
+    user32.SetLayeredWindowAttributes.restype = ctypes.c_int
+    user32.GetLayeredWindowAttributes.argtypes = [
+        ctypes.c_void_p,
+        ctypes.POINTER(ctypes.c_uint32),
+        ctypes.POINTER(ctypes.c_ubyte),
+        ctypes.POINTER(ctypes.c_uint32),
+    ]
+    user32.GetLayeredWindowAttributes.restype = ctypes.c_int
+    user32.IsWindowVisible.argtypes = [ctypes.c_void_p]
+    user32.IsWindowVisible.restype = ctypes.c_int
+    user32.GetWindowRect.argtypes = [ctypes.c_void_p, ctypes.POINTER(_RECT)]
+    user32.GetWindowRect.restype = ctypes.c_int
+    user32.InvalidateRect.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_int]
+    user32.InvalidateRect.restype = ctypes.c_int
+    user32.UpdateWindow.argtypes = [ctypes.c_void_p]
+    user32.UpdateWindow.restype = ctypes.c_int
     _USER32_READY = True
+
+
+def _colorref(hex_color: str) -> int:
+    """Tk '#rrggbb' to a Win32 COLORREF (0x00bbggrr)."""
+    value = hex_color.lstrip("#")
+    red = int(value[0:2], 16)
+    green = int(value[2:4], 16)
+    blue = int(value[4:6], 16)
+    return red | (green << 8) | (blue << 16)
+
+
+def _style_bits(style: int) -> str:
+    unsigned = style & 0xFFFFFFFF
+    names = []
+    for bit, name in (
+        (WS_EX_LAYERED, "LAYERED"),
+        (WS_EX_TRANSPARENT, "TRANSPARENT"),
+        (WS_EX_NOACTIVATE, "NOACTIVATE"),
+        (WS_EX_TOOLWINDOW, "TOOLWINDOW"),
+        (WS_EX_TOPMOST, "TOPMOST"),
+    ):
+        if unsigned & bit:
+            names.append(name)
+    return f"0x{unsigned:08X}" + (f" [{'|'.join(names)}]" if names else "")
+
+
+def _layered_attrs(hwnd: int) -> str:
+    user32 = ctypes.windll.user32
+    key = ctypes.c_uint32()
+    alpha = ctypes.c_ubyte()
+    flags = ctypes.c_uint32()
+    ok = user32.GetLayeredWindowAttributes(
+        hwnd, ctypes.byref(key), ctypes.byref(alpha), ctypes.byref(flags)
+    )
+    if not ok:
+        return "unavailable"
+    flag_bits = flags.value
+    names = []
+    if flag_bits & LWA_COLORKEY:
+        names.append("COLORKEY")
+    if flag_bits & LWA_ALPHA:
+        names.append("ALPHA")
+    return (
+        f"key=0x{key.value:08X} alpha={alpha.value} "
+        f"flags=0x{flag_bits:08X}[{'|'.join(names) or '-'}]"
+    )
+
+
+def _hwnd_rect(hwnd: int) -> str:
+    rect = _RECT()
+    if not ctypes.windll.user32.GetWindowRect(hwnd, ctypes.byref(rect)):
+        return "GetWindowRect failed"
+    return f"ltrb=({rect.left},{rect.top},{rect.right},{rect.bottom})"
 
 
 def _foreground_hwnd() -> int:
@@ -167,49 +255,127 @@ def _restore_foreground(hwnd: int) -> None:
     ctypes.windll.user32.SetForegroundWindow(hwnd)
 
 
-def _tk_hwnds(win: tk.Misc) -> list[int]:
-    """Toplevel frame HWND plus the widget HWND (canvas/client)."""
+def _parse_wm_frame(win: tk.Misc) -> int:
+    try:
+        frame = str(win.wm_frame())
+    except tk.TclError:
+        return 0
+    if not frame:
+        return 0
+    try:
+        return int(frame, 16)
+    except ValueError:
+        return 0
+
+
+def _toplevel_hwnd(win: tk.Misc) -> int:
+    """HWND Tk applies -alpha / -transparentcolor / -topmost to.
+
+    winfo_id() is the client widget. GetParent of that client is the wrapper
+    toplevel — not the canvas, and not GA_ROOT (which can walk to an owner).
+    """
     _configure_user32()
-    user32 = ctypes.windll.user32
     widget = int(win.winfo_id())
-    hwnds: list[int] = []
-    for hwnd in (
-        user32.GetParent(widget),
-        user32.GetAncestor(widget, GA_ROOT),
-        widget,
-    ):
-        value = int(hwnd) if hwnd else 0
-        if value and value not in hwnds:
-            hwnds.append(value)
-    return hwnds
+    parent = ctypes.windll.user32.GetParent(widget)
+    if parent:
+        return int(parent)
+    frame = _parse_wm_frame(win)
+    if frame:
+        return frame
+    ancestor = ctypes.windll.user32.GetAncestor(widget, GA_ROOT)
+    if ancestor:
+        return int(ancestor)
+    return widget
 
 
-def enable_click_through(*widgets: tk.Misc) -> None:
-    """Ignore hit-testing so mouse input reaches windows beneath the overlay."""
+def _log_overlay_snapshot(win: tk.Misc, stage: str, canvas: tk.Misc | None = None) -> None:
+    if not _DEBUG:
+        return
     _configure_user32()
     user32 = ctypes.windll.user32
-    extra = WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW
-    seen: set[int] = set()
-    for widget in widgets:
+    try:
+        widget = int(win.winfo_id())
+        mapped = bool(win.winfo_ismapped())
+        viewable = bool(win.winfo_viewable())
+        state = win.state()
+        geometry = win.winfo_geometry()
+        x, y = win.winfo_x(), win.winfo_y()
+        width, height = win.winfo_width(), win.winfo_height()
+        rootx, rooty = win.winfo_rootx(), win.winfo_rooty()
+    except tk.TclError as exc:
+        _debug(f"{stage}: window gone ({exc})")
+        return
+
+    parent = int(user32.GetParent(widget) or 0)
+    ancestor = int(user32.GetAncestor(widget, GA_ROOT) or 0)
+    frame = _parse_wm_frame(win)
+    chosen = _toplevel_hwnd(win)
+    canvas_id = 0
+    canvas_parent = 0
+    if canvas is not None:
         try:
-            hwnds = _tk_hwnds(widget)
+            canvas_id = int(canvas.winfo_id())
+            canvas_parent = int(user32.GetParent(canvas_id) or 0)
         except tk.TclError:
-            continue
-        for hwnd in hwnds:
-            if hwnd in seen:
-                continue
-            seen.add(hwnd)
-            style = user32.GetWindowLongW(hwnd, GWL_EXSTYLE)
-            user32.SetWindowLongW(hwnd, GWL_EXSTYLE, style | extra)
-            user32.SetWindowPos(
-                hwnd,
-                HWND_TOPMOST,
-                0,
-                0,
-                0,
-                0,
-                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
-            )
+            pass
+
+    _debug(f"{stage}: tk geometry={geometry} x={x} y={y} w={width} h={height} root=({rootx},{rooty})")
+    _debug(f"{stage}: mapped={mapped} viewable={viewable} state={state}")
+    _debug(
+        f"{stage}: hwnds winfo_id=0x{widget:X} wm_frame=0x{frame:X} "
+        f"GetParent=0x{parent:X} GA_ROOT=0x{ancestor:X} using=0x{chosen:X}"
+    )
+    if canvas_id:
+        _debug(f"{stage}: canvas winfo_id=0x{canvas_id:X} GetParent=0x{canvas_parent:X}")
+    _debug(
+        f"{stage}: hwnd 0x{chosen:X} visible={bool(user32.IsWindowVisible(chosen))} "
+        f"{_hwnd_rect(chosen)} exstyle={_style_bits(user32.GetWindowLongW(chosen, GWL_EXSTYLE))} "
+        f"layered={_layered_attrs(chosen)}"
+    )
+
+
+def enable_click_through(win: tk.Misc, chroma: str) -> None:
+    """Click-through the toplevel only; restore color-key so the cat still paints.
+
+    SetWindowLong(WS_EX_LAYERED) clears SetLayeredWindowAttributes. Tk's
+    -transparentcolor also uses that API, so we must put the color key back.
+    Child HWNDs (the canvas) are left alone — layering those without a color
+    key is a common way to make the drawing surface vanish.
+    """
+    _configure_user32()
+    user32 = ctypes.windll.user32
+    try:
+        hwnd = _toplevel_hwnd(win)
+    except tk.TclError:
+        return
+    if not hwnd:
+        _debug("enable_click_through: no toplevel HWND")
+        return
+
+    before = user32.GetWindowLongW(hwnd, GWL_EXSTYLE)
+    extra = WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW
+    after = user32.SetWindowLongW(hwnd, GWL_EXSTYLE, before | extra)
+    pos_ok = user32.SetWindowPos(
+        hwnd,
+        HWND_TOPMOST,
+        0,
+        0,
+        0,
+        0,
+        SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_FRAMECHANGED,
+    )
+    color = _colorref(chroma)
+    layered_ok = user32.SetLayeredWindowAttributes(hwnd, color, 255, LWA_COLORKEY)
+    layered_err = 0 if layered_ok else ctypes.GetLastError()
+    user32.InvalidateRect(hwnd, None, True)
+    user32.UpdateWindow(hwnd)
+    _debug(
+        f"click-through hwnd=0x{hwnd:X} exstyle {_style_bits(before)} -> "
+        f"{_style_bits(user32.GetWindowLongW(hwnd, GWL_EXSTYLE))} "
+        f"(SetWindowLong returned {_style_bits(after)}) "
+        f"SetWindowPos={bool(pos_ok)} SetLayeredWindowAttributes={bool(layered_ok)} "
+        f"last_error={layered_err} colorref=0x{color:08X} layered={_layered_attrs(hwnd)}"
+    )
 
 
 def is_escape_down() -> bool:
@@ -217,38 +383,35 @@ def is_escape_down() -> bool:
     return bool(ctypes.windll.user32.GetAsyncKeyState(VK_ESCAPE) & KEY_CURRENTLY_DOWN)
 
 
-def arm_click_through_overlay(win: tk.Misc, *widgets: tk.Misc) -> None:
-    """Map a withdrawn overlay without stealing focus, then make it click-through."""
+def arm_click_through_overlay(win: tk.Misc, chroma: str, canvas: tk.Misc | None = None) -> None:
+    """Keep the overlay mapped and visible, then make the toplevel click-through."""
     previous = int(getattr(win, "_previous_foreground", 0) or 0)
     try:
+        geometry = getattr(win, "_overlay_geometry", None)
+        if geometry:
+            win.geometry(geometry)
+        win.attributes("-topmost", True)
         win.update_idletasks()
     except tk.TclError:
         return
-    enable_click_through(win, *widgets)
-    try:
-        win.deiconify()
-        win.attributes("-alpha", 1.0)
-        win.update_idletasks()
-    except tk.TclError:
-        return
-    enable_click_through(win, *widgets)
-    try:
-        user32 = ctypes.windll.user32
-        for hwnd in _tk_hwnds(win):
-            user32.ShowWindow(hwnd, SW_SHOWNOACTIVATE)
-    except tk.TclError:
-        pass
+    _log_overlay_snapshot(win, "before-click-through", canvas)
+    enable_click_through(win, chroma)
     _restore_foreground(previous)
+    _log_overlay_snapshot(win, "after-click-through", canvas)
 
     def reapply() -> None:
         try:
             if win.winfo_exists():
-                enable_click_through(win, *widgets)
+                enable_click_through(win, chroma)
         except tk.TclError:
             pass
 
-    win.after(10, reapply)
-    win.after(80, reapply)
+    def settled() -> None:
+        _log_overlay_snapshot(win, "settled", canvas)
+
+    win.after(1, reapply)
+    win.after(50, reapply)
+    win.after(200, settled)
 
 
 def refresh_desktop() -> None:
@@ -296,18 +459,14 @@ def _make_overlay(
     """Create either a standalone Tk root or a Toplevel under an existing app."""
     previous_hwnd = _foreground_hwnd() if (click_through or not steal_focus) else 0
     x, y, width, height = virtual_screen_bounds()
+    geometry = f"{width}x{height}+{x}+{y}"
+    _debug(f"create overlay title={title!r} virtual=({x},{y},{width},{height}) steal_focus={steal_focus} click_through={click_through} transparent_color={transparent_color}")
     if master is None:
         win: tk.Misc = tk.Tk()
         owns_loop = True
     else:
         win = tk.Toplevel(master)
         owns_loop = False
-    if click_through:
-        try:
-            win.withdraw()
-            win.attributes("-alpha", 0.0)
-        except tk.TclError:
-            pass
     win.title(title)
     win.overrideredirect(True)
     win.attributes("-topmost", True)
@@ -317,10 +476,11 @@ def _make_overlay(
         except tk.TclError:
             pass
     win.configure(bg=bg)
-    win.geometry(f"{width}x{height}+{x}+{y}")
+    win.geometry(geometry)
     if steal_focus:
         win.focus_force()
     win._previous_foreground = previous_hwnd  # type: ignore[attr-defined]
+    win._overlay_geometry = geometry  # type: ignore[attr-defined]
     return win, owns_loop
 
 
@@ -459,6 +619,10 @@ def long_break(
 
     kit = _load_cat_kit(cat_size, master=win)
     win._cat_kit = kit  # type: ignore[attr-defined]
+    _debug(
+        f"cat frames walk={len(kit['walk'])} stretch={len(kit['stretch'])} "
+        f"lie={len(kit['lie'])} cat_size={cat_size} rest=({rest_x:.0f},{rest_y:.0f})"
+    )
 
     finished = {"value": False}
 
@@ -512,7 +676,7 @@ def long_break(
         )
         win.bind("<Escape>", lambda _event: finish())
         win.after(2000, finish)
-        arm_click_through_overlay(win, canvas)
+        arm_click_through_overlay(win, CHROMA, canvas)
         if owns_loop:
             win.mainloop()
         return
@@ -683,7 +847,7 @@ def long_break(
 
         win.after(frame_ms, tick)
 
-    arm_click_through_overlay(win, canvas)
+    arm_click_through_overlay(win, CHROMA, canvas)
     win.after(0, tick)
     if owns_loop:
         win.mainloop()
@@ -1120,7 +1284,14 @@ def main() -> int:
         action="store_true",
         help="Skip the startup demo blink",
     )
+    parser.add_argument(
+        "--debug",
+        action="store_true",
+        help="Log overlay HWND, styles and layered attributes to stderr",
+    )
     args = parser.parse_args()
+    env_debug = os.environ.get("EYEREST_DEBUG", "").strip().lower() in {"1", "true", "yes", "on"}
+    set_debug(bool(args.debug or env_debug))
 
     if args.demo_long:
         long_break(max(5.0, args.long_break * 60))
