@@ -4,6 +4,8 @@ as a gentle reminder to rest your eyes.
 
 Every 4th blink is a longer break: a realistic cat walks in, stretches,
 lies down for 5 minutes, then walks away (or sooner if you press Escape).
+The cat overlay stays on top as a reminder but does not block the mouse
+or keyboard, so you can keep using other windows until the break ends.
 """
 
 from __future__ import annotations
@@ -11,6 +13,7 @@ from __future__ import annotations
 import argparse
 import ctypes
 import math
+import os
 import sys
 import threading
 import time
@@ -55,6 +58,28 @@ MONITOR_DEFAULTTOPRIMARY = 1
 SPI_SETDESKWALLPAPER = 0x0014
 SPI_GETDESKWALLPAPER = 0x0073
 MAX_PATH = 260
+GWL_EXSTYLE = -20
+WS_EX_LAYERED = 0x00080000
+WS_EX_TRANSPARENT = 0x00000020
+WS_EX_NOACTIVATE = 0x08000000
+WS_EX_TOOLWINDOW = 0x00000080
+WS_EX_TOPMOST = 0x00000008
+SWP_NOSIZE = 0x0001
+SWP_NOMOVE = 0x0002
+SWP_NOACTIVATE = 0x0010
+SWP_FRAMECHANGED = 0x0020
+GA_ROOT = 2
+VK_ESCAPE = 0x1B
+KEY_CURRENTLY_DOWN = 0x8000
+LWA_COLORKEY = 0x00000001
+LWA_ALPHA = 0x00000002
+HWND_TOPMOST = ctypes.c_void_p(-1)
+_USER32_READY = False
+_DEBUG = False
+
+# Color-key for the cat overlay: fully transparent on Windows, and very
+# unlikely to appear in the cat sprites themselves.
+CAT_OVERLAY_CHROMA = "#ff00ff"
 
 
 class _RECT(ctypes.Structure):
@@ -101,6 +126,294 @@ def ease_in_out(t: float) -> float:
     return t * t * (3.0 - 2.0 * t)
 
 
+def set_debug(enabled: bool) -> None:
+    global _DEBUG
+    _DEBUG = enabled
+
+
+def _debug(message: str) -> None:
+    if _DEBUG:
+        print(f"eyerest debug: {message}", file=sys.stderr, flush=True)
+
+
+def _configure_user32() -> None:
+    """Pin HWND-sized ctypes signatures so 64-bit Windows handles stay intact."""
+    global _USER32_READY
+    if _USER32_READY:
+        return
+    user32 = ctypes.windll.user32
+    user32.GetForegroundWindow.restype = ctypes.c_void_p
+    user32.SetForegroundWindow.argtypes = [ctypes.c_void_p]
+    user32.GetParent.restype = ctypes.c_void_p
+    user32.GetParent.argtypes = [ctypes.c_void_p]
+    user32.GetAncestor.restype = ctypes.c_void_p
+    user32.GetAncestor.argtypes = [ctypes.c_void_p, ctypes.c_uint]
+    user32.GetWindowLongW.argtypes = [ctypes.c_void_p, ctypes.c_int]
+    user32.GetWindowLongW.restype = ctypes.c_long
+    user32.SetWindowLongW.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_long]
+    user32.SetWindowLongW.restype = ctypes.c_long
+    user32.SetWindowPos.restype = ctypes.c_int
+    user32.SetWindowPos.argtypes = [
+        ctypes.c_void_p,
+        ctypes.c_void_p,
+        ctypes.c_int,
+        ctypes.c_int,
+        ctypes.c_int,
+        ctypes.c_int,
+        ctypes.c_uint,
+    ]
+    user32.GetAsyncKeyState.restype = ctypes.c_short
+    user32.GetAsyncKeyState.argtypes = [ctypes.c_int]
+    user32.SetLayeredWindowAttributes.argtypes = [
+        ctypes.c_void_p,
+        ctypes.c_uint32,
+        ctypes.c_ubyte,
+        ctypes.c_uint32,
+    ]
+    user32.SetLayeredWindowAttributes.restype = ctypes.c_int
+    user32.GetLayeredWindowAttributes.argtypes = [
+        ctypes.c_void_p,
+        ctypes.POINTER(ctypes.c_uint32),
+        ctypes.POINTER(ctypes.c_ubyte),
+        ctypes.POINTER(ctypes.c_uint32),
+    ]
+    user32.GetLayeredWindowAttributes.restype = ctypes.c_int
+    user32.IsWindowVisible.argtypes = [ctypes.c_void_p]
+    user32.IsWindowVisible.restype = ctypes.c_int
+    user32.GetWindowRect.argtypes = [ctypes.c_void_p, ctypes.POINTER(_RECT)]
+    user32.GetWindowRect.restype = ctypes.c_int
+    user32.InvalidateRect.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_int]
+    user32.InvalidateRect.restype = ctypes.c_int
+    user32.UpdateWindow.argtypes = [ctypes.c_void_p]
+    user32.UpdateWindow.restype = ctypes.c_int
+    _USER32_READY = True
+
+
+def _colorref(hex_color: str) -> int:
+    """Tk '#rrggbb' to a Win32 COLORREF (0x00bbggrr)."""
+    value = hex_color.lstrip("#")
+    red = int(value[0:2], 16)
+    green = int(value[2:4], 16)
+    blue = int(value[4:6], 16)
+    return red | (green << 8) | (blue << 16)
+
+
+def _style_bits(style: int) -> str:
+    unsigned = style & 0xFFFFFFFF
+    names = []
+    for bit, name in (
+        (WS_EX_LAYERED, "LAYERED"),
+        (WS_EX_TRANSPARENT, "TRANSPARENT"),
+        (WS_EX_NOACTIVATE, "NOACTIVATE"),
+        (WS_EX_TOOLWINDOW, "TOOLWINDOW"),
+        (WS_EX_TOPMOST, "TOPMOST"),
+    ):
+        if unsigned & bit:
+            names.append(name)
+    return f"0x{unsigned:08X}" + (f" [{'|'.join(names)}]" if names else "")
+
+
+def _layered_attrs(hwnd: int) -> str:
+    user32 = ctypes.windll.user32
+    key = ctypes.c_uint32()
+    alpha = ctypes.c_ubyte()
+    flags = ctypes.c_uint32()
+    ok = user32.GetLayeredWindowAttributes(
+        hwnd, ctypes.byref(key), ctypes.byref(alpha), ctypes.byref(flags)
+    )
+    if not ok:
+        return "unavailable"
+    flag_bits = flags.value
+    names = []
+    if flag_bits & LWA_COLORKEY:
+        names.append("COLORKEY")
+    if flag_bits & LWA_ALPHA:
+        names.append("ALPHA")
+    return (
+        f"key=0x{key.value:08X} alpha={alpha.value} "
+        f"flags=0x{flag_bits:08X}[{'|'.join(names) or '-'}]"
+    )
+
+
+def _hwnd_rect(hwnd: int) -> str:
+    rect = _RECT()
+    if not ctypes.windll.user32.GetWindowRect(hwnd, ctypes.byref(rect)):
+        return "GetWindowRect failed"
+    return f"ltrb=({rect.left},{rect.top},{rect.right},{rect.bottom})"
+
+
+def _foreground_hwnd() -> int:
+    _configure_user32()
+    hwnd = ctypes.windll.user32.GetForegroundWindow()
+    return int(hwnd) if hwnd else 0
+
+
+def _restore_foreground(hwnd: int) -> None:
+    if not hwnd:
+        return
+    _configure_user32()
+    ctypes.windll.user32.SetForegroundWindow(hwnd)
+
+
+def _parse_wm_frame(win: tk.Misc) -> int:
+    try:
+        frame = str(win.wm_frame())
+    except tk.TclError:
+        return 0
+    if not frame:
+        return 0
+    try:
+        return int(frame, 16)
+    except ValueError:
+        return 0
+
+
+def _toplevel_hwnd(win: tk.Misc) -> int:
+    """HWND Tk applies -alpha / -transparentcolor / -topmost to.
+
+    winfo_id() is the client widget. GetParent of that client is the wrapper
+    toplevel — not the canvas, and not GA_ROOT (which can walk to an owner).
+    """
+    _configure_user32()
+    widget = int(win.winfo_id())
+    parent = ctypes.windll.user32.GetParent(widget)
+    if parent:
+        return int(parent)
+    frame = _parse_wm_frame(win)
+    if frame:
+        return frame
+    ancestor = ctypes.windll.user32.GetAncestor(widget, GA_ROOT)
+    if ancestor:
+        return int(ancestor)
+    return widget
+
+
+def _log_overlay_snapshot(win: tk.Misc, stage: str, canvas: tk.Misc | None = None) -> None:
+    if not _DEBUG:
+        return
+    _configure_user32()
+    user32 = ctypes.windll.user32
+    try:
+        widget = int(win.winfo_id())
+        mapped = bool(win.winfo_ismapped())
+        viewable = bool(win.winfo_viewable())
+        state = win.state()
+        geometry = win.winfo_geometry()
+        x, y = win.winfo_x(), win.winfo_y()
+        width, height = win.winfo_width(), win.winfo_height()
+        rootx, rooty = win.winfo_rootx(), win.winfo_rooty()
+    except tk.TclError as exc:
+        _debug(f"{stage}: window gone ({exc})")
+        return
+
+    parent = int(user32.GetParent(widget) or 0)
+    ancestor = int(user32.GetAncestor(widget, GA_ROOT) or 0)
+    frame = _parse_wm_frame(win)
+    chosen = _toplevel_hwnd(win)
+    canvas_id = 0
+    canvas_parent = 0
+    if canvas is not None:
+        try:
+            canvas_id = int(canvas.winfo_id())
+            canvas_parent = int(user32.GetParent(canvas_id) or 0)
+        except tk.TclError:
+            pass
+
+    _debug(f"{stage}: tk geometry={geometry} x={x} y={y} w={width} h={height} root=({rootx},{rooty})")
+    _debug(f"{stage}: mapped={mapped} viewable={viewable} state={state}")
+    _debug(
+        f"{stage}: hwnds winfo_id=0x{widget:X} wm_frame=0x{frame:X} "
+        f"GetParent=0x{parent:X} GA_ROOT=0x{ancestor:X} using=0x{chosen:X}"
+    )
+    if canvas_id:
+        _debug(f"{stage}: canvas winfo_id=0x{canvas_id:X} GetParent=0x{canvas_parent:X}")
+    _debug(
+        f"{stage}: hwnd 0x{chosen:X} visible={bool(user32.IsWindowVisible(chosen))} "
+        f"{_hwnd_rect(chosen)} exstyle={_style_bits(user32.GetWindowLongW(chosen, GWL_EXSTYLE))} "
+        f"layered={_layered_attrs(chosen)}"
+    )
+
+
+def enable_click_through(win: tk.Misc, chroma: str) -> None:
+    """Click-through the toplevel only; restore color-key so the cat still paints.
+
+    SetWindowLong(WS_EX_LAYERED) clears SetLayeredWindowAttributes. Tk's
+    -transparentcolor also uses that API, so we must put the color key back.
+    Child HWNDs (the canvas) are left alone — layering those without a color
+    key is a common way to make the drawing surface vanish.
+    """
+    _configure_user32()
+    user32 = ctypes.windll.user32
+    try:
+        hwnd = _toplevel_hwnd(win)
+    except tk.TclError:
+        return
+    if not hwnd:
+        _debug("enable_click_through: no toplevel HWND")
+        return
+
+    before = user32.GetWindowLongW(hwnd, GWL_EXSTYLE)
+    extra = WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW
+    after = user32.SetWindowLongW(hwnd, GWL_EXSTYLE, before | extra)
+    pos_ok = user32.SetWindowPos(
+        hwnd,
+        HWND_TOPMOST,
+        0,
+        0,
+        0,
+        0,
+        SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_FRAMECHANGED,
+    )
+    color = _colorref(chroma)
+    layered_ok = user32.SetLayeredWindowAttributes(hwnd, color, 255, LWA_COLORKEY)
+    layered_err = 0 if layered_ok else ctypes.GetLastError()
+    user32.InvalidateRect(hwnd, None, True)
+    user32.UpdateWindow(hwnd)
+    _debug(
+        f"click-through hwnd=0x{hwnd:X} exstyle {_style_bits(before)} -> "
+        f"{_style_bits(user32.GetWindowLongW(hwnd, GWL_EXSTYLE))} "
+        f"(SetWindowLong returned {_style_bits(after)}) "
+        f"SetWindowPos={bool(pos_ok)} SetLayeredWindowAttributes={bool(layered_ok)} "
+        f"last_error={layered_err} colorref=0x{color:08X} layered={_layered_attrs(hwnd)}"
+    )
+
+
+def is_escape_down() -> bool:
+    _configure_user32()
+    return bool(ctypes.windll.user32.GetAsyncKeyState(VK_ESCAPE) & KEY_CURRENTLY_DOWN)
+
+
+def arm_click_through_overlay(win: tk.Misc, chroma: str, canvas: tk.Misc | None = None) -> None:
+    """Keep the overlay mapped and visible, then make the toplevel click-through."""
+    previous = int(getattr(win, "_previous_foreground", 0) or 0)
+    try:
+        geometry = getattr(win, "_overlay_geometry", None)
+        if geometry:
+            win.geometry(geometry)
+        win.attributes("-topmost", True)
+        win.update_idletasks()
+    except tk.TclError:
+        return
+    _log_overlay_snapshot(win, "before-click-through", canvas)
+    enable_click_through(win, chroma)
+    _restore_foreground(previous)
+    _log_overlay_snapshot(win, "after-click-through", canvas)
+
+    def reapply() -> None:
+        try:
+            if win.winfo_exists():
+                enable_click_through(win, chroma)
+        except tk.TclError:
+            pass
+
+    def settled() -> None:
+        _log_overlay_snapshot(win, "settled", canvas)
+
+    win.after(1, reapply)
+    win.after(50, reapply)
+    win.after(200, settled)
+
+
 def refresh_desktop() -> None:
     """Ask Windows to redraw the desktop after a translucent overlay closes."""
     user32 = ctypes.windll.user32
@@ -138,9 +451,16 @@ def _make_overlay(
     master: tk.Misc | None,
     title: str,
     bg: str,
+    *,
+    steal_focus: bool = True,
+    click_through: bool = False,
+    transparent_color: str | None = None,
 ) -> tuple[tk.Misc, bool]:
     """Create either a standalone Tk root or a Toplevel under an existing app."""
+    previous_hwnd = _foreground_hwnd() if (click_through or not steal_focus) else 0
     x, y, width, height = virtual_screen_bounds()
+    geometry = f"{width}x{height}+{x}+{y}"
+    _debug(f"create overlay title={title!r} virtual=({x},{y},{width},{height}) steal_focus={steal_focus} click_through={click_through} transparent_color={transparent_color}")
     if master is None:
         win: tk.Misc = tk.Tk()
         owns_loop = True
@@ -150,9 +470,17 @@ def _make_overlay(
     win.title(title)
     win.overrideredirect(True)
     win.attributes("-topmost", True)
+    if transparent_color:
+        try:
+            win.attributes("-transparentcolor", transparent_color)
+        except tk.TclError:
+            pass
     win.configure(bg=bg)
-    win.geometry(f"{width}x{height}+{x}+{y}")
-    win.focus_force()
+    win.geometry(geometry)
+    if steal_focus:
+        win.focus_force()
+    win._previous_foreground = previous_hwnd  # type: ignore[attr-defined]
+    win._overlay_geometry = geometry  # type: ignore[attr-defined]
     return win, owns_loop
 
 
@@ -249,24 +577,29 @@ def long_break(
     master: tk.Misc | None = None,
     done: threading.Event | None = None,
 ) -> None:
-    """Block the screen; cat walks in, stretches, lies down, then leaves."""
+    """Click-through cat overlay: walks in, stretches, lies down, then leaves."""
     x, y, width, height = virtual_screen_bounds()
     frame_ms = max(1, int(1000 / FPS))
 
-    BG = "#1c1916"
+    CHROMA = CAT_OVERLAY_CHROMA
     FLOOR = "#2a2520"
-    win, owns_loop = _make_overlay(master, "EyeRest - long break", BG)
-    win.attributes("-alpha", 1.0)
+    win, owns_loop = _make_overlay(
+        master,
+        "EyeRest - long break",
+        CHROMA,
+        steal_focus=False,
+        click_through=True,
+        transparent_color=CHROMA,
+    )
 
     canvas = tk.Canvas(
         win,
         width=width,
         height=height,
-        bg=BG,
+        bg=CHROMA,
         highlightthickness=0,
     )
     canvas.pack(fill="both", expand=True)
-    canvas.create_rectangle(0, 0, width, height, fill=BG, outline="")
 
     rest_x = width * 0.75
     rest_y = height * 0.58
@@ -286,6 +619,10 @@ def long_break(
 
     kit = _load_cat_kit(cat_size, master=win)
     win._cat_kit = kit  # type: ignore[attr-defined]
+    _debug(
+        f"cat frames walk={len(kit['walk'])} stretch={len(kit['stretch'])} "
+        f"lie={len(kit['lie'])} cat_size={cat_size} rest=({rest_x:.0f},{rest_y:.0f})"
+    )
 
     finished = {"value": False}
 
@@ -295,15 +632,51 @@ def long_break(
         finished["value"] = True
         close_overlay(win, done)
 
+    labels: dict[str, tuple[int, int]] = {}
+
+    def add_label(
+        name: str,
+        x: float,
+        y: float,
+        text: str,
+        fill: str,
+        font: tuple[str, int],
+    ) -> None:
+        shadow = canvas.create_text(
+            x + 1,
+            y + 2,
+            text=text,
+            fill="#1a1512",
+            font=font,
+            anchor="center",
+        )
+        item = canvas.create_text(
+            x,
+            y,
+            text=text,
+            fill=fill,
+            font=font,
+            anchor="center",
+        )
+        labels[name] = (item, shadow)
+
+    def set_label(name: str, text: str) -> None:
+        item, shadow = labels[name]
+        canvas.itemconfigure(item, text=text)
+        canvas.itemconfigure(shadow, text=text)
+
     if not kit["walk"]:
-        canvas.create_text(
+        add_label(
+            "missing",
             width / 2,
             height / 2,
-            text="(cat images missing)",
-            fill="#f7e8d8",
-            font=("Segoe UI", 22),
+            "(cat images missing)",
+            "#f7e8d8",
+            ("Segoe UI", 22),
         )
+        win.bind("<Escape>", lambda _event: finish())
         win.after(2000, finish)
+        arm_click_through_overlay(win, CHROMA, canvas)
         if owns_loop:
             win.mainloop()
         return
@@ -311,37 +684,37 @@ def long_break(
     first = kit["walk"][0]
     cat_id = canvas.create_image(start_x, rest_y, image=first, anchor="center")
 
-    message = canvas.create_text(
+    add_label(
+        "message",
         width / 2,
         height * 0.18,
-        text="Time for a longer break",
-        fill="#f3ebe3",
-        font=("Segoe UI Semibold", 28),
-        anchor="center",
+        "Time for a longer break",
+        "#f3ebe3",
+        ("Segoe UI Semibold", 28),
     )
-    subtitle = canvas.create_text(
+    add_label(
+        "subtitle",
         width / 2,
         height * 0.18 + 42,
-        text="A little friend is settling in...",
-        fill="#c4b5a5",
-        font=("Segoe UI", 16),
-        anchor="center",
+        "A little friend is settling in...",
+        "#c4b5a5",
+        ("Segoe UI", 16),
     )
-    timer_text = canvas.create_text(
+    add_label(
+        "timer",
         width / 2,
         height * 0.18 + 84,
-        text="",
-        fill="#e8d3b8",
-        font=("Segoe UI", 18),
-        anchor="center",
+        "",
+        "#e8d3b8",
+        ("Segoe UI", 18),
     )
-    hint = canvas.create_text(
+    add_label(
+        "hint",
         width / 2,
         height * 0.92,
-        text="Press Esc to gently send the cat away",
-        fill="#8a7f74",
-        font=("Segoe UI", 13),
-        anchor="center",
+        "Keep working if you need to. Esc sends the cat away",
+        "#8a7f74",
+        ("Segoe UI", 13),
     )
 
     state = {
@@ -376,10 +749,11 @@ def long_break(
         state["phase"] = "exit"
         state["phase_t0"] = time.perf_counter()
         set_pose("walk", 0)
-        canvas.itemconfigure(hint, text="Okay... walking away...")
-        canvas.itemconfigure(subtitle, text="See you after a few more blinks.")
+        set_label("hint", "Okay... walking away...")
+        set_label("subtitle", "See you after a few more blinks.")
 
     win.bind("<Escape>", begin_exit)
+    escape = {"down": is_escape_down()}
 
     def format_mmss(seconds: float) -> str:
         secs = max(0, int(math.ceil(seconds)))
@@ -388,6 +762,10 @@ def long_break(
     def tick() -> None:
         if finished["value"]:
             return
+        down = is_escape_down()
+        if down and not escape["down"]:
+            begin_exit()
+        escape["down"] = down
         if state["phase"] == "done":
             finish()
             return
@@ -403,38 +781,38 @@ def long_break(
                 frame_i = int(elapsed * WALK_FRAME_HZ) % max(1, len(kit["walk"]))
                 set_pose("walk", frame_i)
                 place_cat(nx, rest_y, bob)
-                canvas.itemconfigure(subtitle, text="Walking over to rest with you...")
-                canvas.itemconfigure(timer_text, text=format_mmss(duration_seconds))
+                set_label("subtitle", "Walking over to rest with you...")
+                set_label("timer", format_mmss(duration_seconds))
                 if elapsed >= WALK_SECONDS:
                     place_cat(rest_x, rest_y, 0)
                     state["phase"] = "stretch"
                     state["phase_t0"] = now
                     set_pose("stretch")
-                    canvas.itemconfigure(subtitle, text="Big stretch...")
+                    set_label("subtitle", "Big stretch...")
 
             elif state["phase"] == "stretch":
                 t = ease_in_out(min(1.0, elapsed / STRETCH_SECONDS))
                 bob = math.sin(t * math.pi) * -12
                 place_cat(rest_x, rest_y, bob)
-                canvas.itemconfigure(timer_text, text=format_mmss(duration_seconds))
+                set_label("timer", format_mmss(duration_seconds))
                 if elapsed >= STRETCH_SECONDS:
                     state["phase"] = "lie_down"
                     state["phase_t0"] = now
                     set_pose("lie")
-                    canvas.itemconfigure(subtitle, text="Lying down...")
+                    set_label("subtitle", "Lying down...")
 
             elif state["phase"] == "lie_down":
                 t = ease_in_out(min(1.0, elapsed / LIE_SECONDS))
                 bob = (1.0 - t) * 18
                 place_cat(rest_x, rest_y + 10 * t, bob)
-                canvas.itemconfigure(timer_text, text=format_mmss(duration_seconds))
+                set_label("timer", format_mmss(duration_seconds))
                 if elapsed >= LIE_SECONDS:
                     place_cat(rest_x, rest_y + 10, 0)
                     state["phase"] = "rest"
                     state["phase_t0"] = now
-                    canvas.itemconfigure(
-                        subtitle,
-                        text="Your cat is resting. Stretch, look away, breathe.",
+                    set_label(
+                        "subtitle",
+                        "Your cat is resting. Stretch, look away, breathe.",
                     )
 
             elif state["phase"] == "rest":
@@ -442,14 +820,14 @@ def long_break(
                 bob = math.sin(elapsed * 1.15) * 3.5
                 place_cat(rest_x, rest_y + 10, bob)
                 remaining = duration_seconds - elapsed
-                canvas.itemconfigure(timer_text, text=format_mmss(remaining))
+                set_label("timer", format_mmss(remaining))
                 if remaining <= 0:
                     state["exit_from_x"] = state["cat_x"]
                     state["phase"] = "exit"
                     state["phase_t0"] = now
                     set_pose("walk", 0)
-                    canvas.itemconfigure(hint, text="Break over - off the cat goes...")
-                    canvas.itemconfigure(subtitle, text="Nice rest. Back to it gently.")
+                    set_label("hint", "Break over - off the cat goes...")
+                    set_label("subtitle", "Nice rest. Back to it gently.")
 
             elif state["phase"] == "exit":
                 t = ease_in_out(min(1.0, elapsed / WALK_SECONDS))
@@ -467,9 +845,9 @@ def long_break(
             finish()
             return
 
-        _ = message
         win.after(frame_ms, tick)
 
+    arm_click_through_overlay(win, CHROMA, canvas)
     win.after(0, tick)
     if owns_loop:
         win.mainloop()
@@ -849,6 +1227,7 @@ class EyeRestApp:
             f"{self.long_break_seconds / 60:.0f} minutes"
         )
         print("  Press Escape during a blink to skip it.")
+        print("  Cat breaks stay on screen but do not block the mouse or keyboard.")
         print("  Press Escape during a long break to send the cat away.")
         print("  Use the panel to jump to a cycle phase, or Start now.")
         print("  Press Ctrl+C in this window to quit.\n")
@@ -905,7 +1284,14 @@ def main() -> int:
         action="store_true",
         help="Skip the startup demo blink",
     )
+    parser.add_argument(
+        "--debug",
+        action="store_true",
+        help="Log overlay HWND, styles and layered attributes to stderr",
+    )
     args = parser.parse_args()
+    env_debug = os.environ.get("EYEREST_DEBUG", "").strip().lower() in {"1", "true", "yes", "on"}
+    set_debug(bool(args.debug or env_debug))
 
     if args.demo_long:
         long_break(max(5.0, args.long_break * 60))
