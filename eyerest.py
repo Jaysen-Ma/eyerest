@@ -17,6 +17,7 @@ import sys
 import threading
 import time
 import tkinter as tk
+from collections.abc import Callable
 from pathlib import Path
 
 INTERVAL_SECONDS = 25 * 60
@@ -206,25 +207,30 @@ class CatBreakWarning:
     """Small non-activating corner toast; does not block the rest of the desktop."""
 
     WIDTH = 368
-    HEIGHT = 132
     PAD = 16
 
     def __init__(
         self,
         master: tk.Misc,
-        remaining_fn: object,
+        timer_state: Callable[[], tuple[float, bool]],
+        toggle_pause: Callable[[], None],
         break_seconds: float,
     ) -> None:
-        self._remaining_fn = remaining_fn
+        self._timer_state = timer_state
+        self._toggle_pause = toggle_pause
         self._closed = False
+        self._tick_id: str | None = None
         previous = _foreground_hwnd()
         self.win = tk.Toplevel(master)
+        self.win.withdraw()
+        self.win.title("Cat break reminder")
         self.win.overrideredirect(True)
         self.win.attributes("-topmost", True)
         self.win.configure(bg="#25211d")
         self.win.resizable(False, False)
 
         frame = tk.Frame(self.win, bg="#25211d", padx=14, pady=12)
+        self._frame = frame
         frame.pack(fill="both", expand=True)
         self._countdown = tk.Label(
             frame,
@@ -246,7 +252,7 @@ class CatBreakWarning:
         minutes = max(1, int(round(break_seconds / 60)))
         tk.Label(
             frame,
-            text=f"Save your work. About {minutes} min once it starts. Click to dismiss.",
+            text=f"Save your work. About {minutes} min once it starts.",
             bg="#25211d",
             fg="#c4b5a5",
             font=("Segoe UI", 9),
@@ -255,7 +261,43 @@ class CatBreakWarning:
             justify="left",
         ).pack(anchor="w", pady=(2, 0))
 
-        self._place()
+        controls = tk.Frame(frame, bg="#25211d")
+        controls.pack(fill="x", pady=(10, 0))
+        button_style = {
+            "fg": "#ffffff",
+            "activeforeground": "#ffffff",
+            "relief": "flat",
+            "padx": 10,
+            "pady": 4,
+            "font": ("Segoe UI Semibold", 9),
+            "cursor": "hand2",
+        }
+        self._pause_button = tk.Button(
+            controls, width=8, command=self._on_pause, **button_style
+        )
+        self._pause_button.pack(side="left")
+        tk.Button(
+            controls,
+            text="Minimize",
+            command=self._minimize,
+            bg="#403831",
+            activebackground="#55483d",
+            **button_style,
+        ).pack(side="right")
+        self._restore_button = tk.Button(
+            self.win,
+            width=22,
+            command=self._restore,
+            bg="#403831",
+            activebackground="#55483d",
+            **button_style,
+        )
+
+        self._tick()
+        self.win.update_idletasks()
+        self._height = frame.winfo_reqheight()
+        self._place(self.WIDTH, self._height)
+        self.win.deiconify()
         self.win.update_idletasks()
         try:
             _apply_no_activate(self.win)
@@ -263,38 +305,56 @@ class CatBreakWarning:
             pass
         _restore_foreground(previous)
 
-        def bind_dismiss(widget: tk.Misc) -> None:
-            widget.bind("<Button-1>", lambda _event: self.destroy())
-            for child in widget.winfo_children():
-                bind_dismiss(child)
+    def _minimize(self) -> None:
+        self._frame.pack_forget()
+        self._restore_button.pack(fill="both", expand=True)
+        self._place(self._restore_button.winfo_reqwidth(), self._restore_button.winfo_reqheight())
 
-        bind_dismiss(self.win)
-        self._tick()
+    def _restore(self) -> None:
+        self._restore_button.pack_forget()
+        self._frame.pack(fill="both", expand=True)
+        self._place(self.WIDTH, self._height)
 
-    def _place(self) -> None:
+    def _place(self, width: int, height: int) -> None:
         left, top, right, bottom = primary_work_area()
-        x = right - self.WIDTH - self.PAD
-        y = bottom - self.HEIGHT - self.PAD
+        x = right - width - self.PAD
+        y = bottom - height - self.PAD
         x = max(left + self.PAD, x)
         y = max(top + self.PAD, y)
-        self.win.geometry(f"{self.WIDTH}x{self.HEIGHT}+{x}+{y}")
+        self.win.geometry(f"{width}x{height}+{x}+{y}")
+
+    def _on_pause(self) -> None:
+        self._toggle_pause()
+        self._update_controls()
+
+    def _update_controls(self) -> None:
+        remaining, paused = self._timer_state()
+        secs = max(0, int(math.ceil(remaining)))
+        time_left = f"{secs // 60}:{secs % 60:02d}"
+        self._countdown.config(
+            text=f"Cat break paused · {time_left}" if paused else f"Cat break in {time_left}",
+            fg="#c9a46c" if paused else "#fff4e8",
+        )
+        self._pause_button.config(
+            text="Resume" if paused else "Pause",
+            bg="#3f7a5a" if paused else "#5a6b7a",
+            activebackground="#4f956c" if paused else "#6f8294",
+        )
+        self._restore_button.config(
+            text="Restore paused reminder" if paused else "Restore reminder",
+        )
 
     def _tick(self) -> None:
-        if self._closed:
-            return
-        try:
-            remaining = float(self._remaining_fn())  # type: ignore[operator]
-            secs = max(0, int(math.ceil(remaining)))
-            self._countdown.config(text=f"Cat break in {secs // 60}:{secs % 60:02d}")
-        except tk.TclError:
-            return
-        self.win.after(200, self._tick)
+        self._update_controls()
+        self._tick_id = self.win.after(200, self._tick)
 
     def destroy(self) -> None:
         if self._closed:
             return
         self._closed = True
         try:
+            if self._tick_id is not None:
+                self.win.after_cancel(self._tick_id)
             self.win.destroy()
         except tk.TclError:
             pass
@@ -666,7 +726,6 @@ class EyeRestApp:
         self._blink_count = 0
         self._lock = threading.Lock()
         self._wake_event = threading.Event()
-        self._busy = False
         self._warning: CatBreakWarning | None = None
         self._warning_logged = False
 
@@ -718,12 +777,21 @@ class EyeRestApp:
             self._deadline = time.monotonic()
         self._wake_event.set()
 
-    def consume_next_session(self) -> str:
+    def consume_due_session(self) -> str | None:
         with self._lock:
-            self._blink_count += 1
-            if self._blink_count % self.long_break_every == 0:
-                return SESSION_LONG
-            return SESSION_BLINK
+            now = time.monotonic()
+            if self._paused or self._deadline > now:
+                return None
+            upcoming = self._blink_count + 1
+            is_long = upcoming % self.long_break_every == 0
+            if is_long and self.warn_seconds > 0 and not self._warning_logged:
+                # Start now still gives a heads-up with a countdown that can be paused.
+                lead = min(self.warn_seconds, START_NOW_WARN_SECONDS)
+                self._deadline = now + lead
+                self._show_cat_warning(lead)
+                return None
+            self._blink_count = upcoming
+            return SESSION_LONG if is_long else SESSION_BLINK
 
     def planned_next_session(self) -> str:
         with self._lock:
@@ -766,11 +834,14 @@ class EyeRestApp:
         with self._lock:
             return self._paused
 
-    def seconds_remaining(self) -> float:
+    def timer_state(self) -> tuple[float, bool]:
         with self._lock:
-            if self._paused:
-                return max(0.0, self._remaining_when_paused)
-            return max(0.0, self._deadline - time.monotonic())
+            remaining = (
+                self._remaining_when_paused
+                if self._paused
+                else self._deadline - time.monotonic()
+            )
+            return max(0.0, remaining), self._paused
 
     def wait_until_due(self) -> None:
         while True:
@@ -787,27 +858,13 @@ class EyeRestApp:
             self._wake_event.wait(timeout=timeout)
             self._wake_event.clear()
 
-    def _wait_seconds_or_wake(self, seconds: float) -> None:
-        deadline = time.monotonic() + max(0.0, seconds)
-        while True:
-            left = deadline - time.monotonic()
-            if left <= 0 or self.is_paused():
-                return
-            if self.seconds_remaining() > seconds + 0.5:
-                return
-            self._wake_event.wait(timeout=min(left, 0.25))
-            self._wake_event.clear()
-
     def _open_warning_widget(self) -> None:
         if self._warning is not None:
-            try:
-                if self._warning.win.winfo_exists():
-                    return
-            except tk.TclError:
-                self._warning = None
+            return
         self._warning = CatBreakWarning(
             self.root,
-            remaining_fn=self.seconds_remaining,
+            timer_state=self.timer_state,
+            toggle_pause=self.toggle_pause,
             break_seconds=self.long_break_seconds,
         )
 
@@ -817,16 +874,15 @@ class EyeRestApp:
         if warning is not None:
             warning.destroy()
 
-    def _show_cat_warning(self) -> None:
-        remaining = self.seconds_remaining()
-        lead = remaining if remaining > 0.05 else min(self.warn_seconds, START_NOW_WARN_SECONDS)
-        if not self._warning_logged:
-            self._warning_logged = True
-            secs = max(1, int(math.ceil(lead)))
-            print(
-                f"[{time.strftime('%H:%M:%S')}] Cat break in {secs}s — "
-                "screen will go dark."
-            )
+    def _show_cat_warning(self, remaining: float) -> None:
+        if self._warning_logged:
+            return
+        self._warning_logged = True
+        secs = max(1, int(math.ceil(remaining)))
+        print(
+            f"[{time.strftime('%H:%M:%S')}] Cat break in {secs}s — "
+            "screen will go dark."
+        )
         self.root.after(0, self._open_warning_widget)
 
     def _hide_cat_warning(self) -> None:
@@ -835,12 +891,30 @@ class EyeRestApp:
         self._warning_logged = False
         self.root.after(0, self._close_warning_widget)
 
-    def _run_session_on_ui(self, session: str) -> None:
+    def _run_session_on_ui(self, demo_session: str | None = None) -> bool:
         """Run blink/long-break on the Tk thread as a Toplevel, wait until done."""
         done = threading.Event()
+        started = False
 
         def start() -> None:
+            nonlocal started
+            session = demo_session or self.consume_due_session()
+            if session is None:
+                done.set()
+                return
+            started = True
             self._close_warning_widget()
+            if demo_session is None:
+                stamp = time.strftime("%H:%M:%S")
+                if session == SESSION_LONG:
+                    print(f"[{stamp}] Long break - cat is coming to rest...")
+                else:
+                    count = self.blink_count()
+                    print(
+                        f"[{stamp}] Rest your eyes - blinking "
+                        f"({count % self.long_break_every}/"
+                        f"{self.long_break_every} until long break)..."
+                    )
             if session == SESSION_LONG:
                 long_break(self.long_break_seconds, master=self.root, done=done)
             else:
@@ -848,6 +922,7 @@ class EyeRestApp:
 
         self.root.after(0, start)
         done.wait()
+        return started
 
     def _reminder_loop(self) -> None:
         try:
@@ -864,24 +939,20 @@ class EyeRestApp:
                 )
 
             while True:
-                if self._busy:
-                    time.sleep(0.2)
-                    continue
-
-                paused = self.is_paused()
-                remaining = self.seconds_remaining()
+                remaining, paused = self.timer_state()
                 next_session = self.planned_next_session()
                 warn = self.warn_seconds if next_session == SESSION_LONG else 0.0
 
                 if paused:
-                    self._hide_cat_warning()
+                    if warn <= 0 or remaining > warn:
+                        self._hide_cat_warning()
                     self._wake_event.wait(timeout=0.25)
                     self._wake_event.clear()
                     continue
 
-                if next_session == SESSION_LONG and warn > 0 and remaining > 0.05:
+                if remaining > 0:
                     if remaining <= warn:
-                        self._show_cat_warning()
+                        self._show_cat_warning(remaining)
                     else:
                         self._hide_cat_warning()
                     wait_for = remaining if remaining <= warn else remaining - warn
@@ -889,45 +960,14 @@ class EyeRestApp:
                     self._wake_event.clear()
                     continue
 
-                if remaining > 0.05:
-                    self._hide_cat_warning()
-                    self._wake_event.wait(timeout=min(max(remaining, 0.0), 0.25))
-                    self._wake_event.clear()
-                    continue
-
-                if next_session == SESSION_LONG and warn > 0 and not self._warning_logged:
-                    self._show_cat_warning()
-                    self._wait_seconds_or_wake(min(warn, START_NOW_WARN_SECONDS))
-                    self._hide_cat_warning()
-                    if self.is_paused() or self.seconds_remaining() > 0.05:
-                        continue
-                    if self.planned_next_session() != SESSION_LONG:
-                        continue
-
-                self._busy = True
-                try:
-                    session = self.consume_next_session()
-                    count = self.blink_count()
-                    stamp = time.strftime("%H:%M:%S")
-
-                    if session == SESSION_LONG:
-                        print(f"[{stamp}] Long break - cat is coming to rest...")
-                    else:
-                        print(
-                            f"[{stamp}] Rest your eyes - blinking "
-                            f"({count % self.long_break_every}/"
-                            f"{self.long_break_every} until long break)..."
-                        )
-                    self._run_session_on_ui(session)
+                if self._run_session_on_ui():
                     self.reset()
+                    self._hide_cat_warning()
                     next_at = time.time() + self.interval_seconds
                     print(
                         "Next event at "
                         f"{time.strftime('%H:%M:%S', time.localtime(next_at))}."
                     )
-                finally:
-                    self._busy = False
-                    self._hide_cat_warning()
         except Exception as exc:  # noqa: BLE001 - keep panel alive, log the failure
             print(f"EyeRest reminder loop error: {exc}")
 
@@ -1067,8 +1107,8 @@ class EyeRestApp:
             return f"Next: Short blink · {shorts_left} then cat"
 
         def update_countdown() -> None:
-            seconds = int(math.ceil(self.seconds_remaining()))
-            paused = self.is_paused()
+            remaining, paused = self.timer_state()
+            seconds = int(math.ceil(remaining))
             session = self.planned_next_session()
             phase = self.current_phase()
             countdown.config(text=f"{seconds // 60:02d}:{seconds % 60:02d}")
@@ -1141,18 +1181,39 @@ def run_demo_long(duration_seconds: float, warn_seconds: float) -> None:
     root = tk.Tk()
     root.withdraw()
     deadline = time.monotonic() + warn_seconds
+    paused_remaining: float | None = None
+
+    def timer_state() -> tuple[float, bool]:
+        if paused_remaining is not None:
+            return paused_remaining, True
+        return max(0.0, deadline - time.monotonic()), False
+
+    def toggle_pause() -> None:
+        nonlocal deadline, paused_remaining
+        if paused_remaining is None:
+            paused_remaining, _ = timer_state()
+        else:
+            deadline = time.monotonic() + paused_remaining
+            paused_remaining = None
+
     print(
         f"Cat break in {warn_seconds:.0f}s — screen will go dark. "
         "You can keep using other windows until then."
     )
     warning = CatBreakWarning(
         root,
-        remaining_fn=lambda: max(0.0, deadline - time.monotonic()),
+        timer_state=timer_state,
+        toggle_pause=toggle_pause,
         break_seconds=duration_seconds,
     )
     finished = threading.Event()
 
     def start_break() -> None:
+        remaining, paused = timer_state()
+        if paused or remaining > 0:
+            delay = 100 if paused else max(1, min(100, math.ceil(remaining * 1000)))
+            root.after(delay, start_break)
+            return
         warning.destroy()
         print("Long break - cat is coming to rest...")
         long_break(duration_seconds, master=root, done=finished)
@@ -1166,7 +1227,7 @@ def run_demo_long(duration_seconds: float, warn_seconds: float) -> None:
             return
         root.after(100, poll_finished)
 
-    root.after(max(1, int(warn_seconds * 1000)), start_break)
+    root.after(0, start_break)
     root.after(100, poll_finished)
     try:
         root.mainloop()
